@@ -1,0 +1,88 @@
+https://github.com/T-Auto/dsh-ops | T-Auto/dsh-ops: A toolkit for low-level operations in DSH, designed to reduce token usage and task execution time / DSH 底层操作工具插件，旨在减少 Token 消耗与任务耗时
+https://github.com/yc-duan/fastctx | yc-duan/fastctx: Fast, context-efficient repository tools for AI agents (MCP)
+https://github.com/rtk-ai/rtk | rtk-ai/rtk: CLI proxy that reduces LLM token consumption by 60-90% on common dev commands. Single Rust binary, zero dependencies
+
+两个仓库都读完了一手材料（含 rtk 的 README 原文），可以给结论了。
+结论：不能完全取代，两者只在"文件/搜索类工具"这一小块重叠
+
+它们解决的是不同层的问题：rtk 改的是 shell 命令的输出，dsh-ops 改的是宿主工具层本身。所以严格说不是"谁替谁"，而是部分功能重叠、整体互补。
+一、各自是什么
+
+| | rtk-ai/rtk | T-Auto/dsh-ops |
+|---|---|---|
+| 形态 | 独立 CLI 二进制（Rust），单文件、零运行时依赖，100+ 命令、开销 <10ms | DSH（DeepSeek Harness）插件，随 npm 包/插件市场装进某个 DSH profile |
+| 机制 | 通过各宿主的 PreToolUse 类钩子，把 git status 之类命令透明改写成 rtk git status，模型无需知道 rtk 存在 | 提供一组 Rust 常驻工具（渐进式披露），可关闭宿主原版工具 |
+| 覆盖 | 18+ 个 AI 编码宿主（Claude Code、Cursor、Copilot、Gemini CLI、Codex、Windsurf、Cline、OpenCode、Pi、Hermes、Vibe、Kilo、Antigravity、Kimi、Droid、Trae…）[citation:web:1.1,1.40] | 只在 DSH 内生效；0.3.0 仅 Windows x64，目标 DSH 0.2.0-rc.2，Linux/macOS/ARM64 留待后续 [citation:web:1.79,1.87] |
+| 平台 | macOS / Linux / Windows / WSL（brew、winget、curl）[citation:web:1.1] | 仅 Windows（自带 bash 5.3.15 + PowerShell 7.6.6）[citation:web:1.79,1.87] |
+二、重叠的部分（你的直觉对的地方）
+
+dsh-ops 的 file 组件确实覆盖了 rtk 的文件/搜索命令族：
+
+| 能力 | rtk | dsh-ops |
+|---|---|---|
+| 智能读文件 | rtk read（优先保留签名/结构，可 -l aggressive 只留签名）| opsinspectlocal_file（有界文本行 / hex 视图）|
+| 搜索内容 | rtk grep（按文件分组、截断长行）| ops_grep（Rust regex，有界、分页、行上下文）|
+| 找路径 | rtk find、rtk ls（树形+计数）| ops_glob（多模式、支持排除）|
+| 批量改写 | 无对应命令 | ops_replace（字面替换、dry-run、原子写）|
+| 跑命令 | 钩子改写后由 rtk 代理执行 | ops_bash（优先的通用执行器）|
+
+两边目标也一致：让模型少读字节、少踩报错。[citation:web:1.12,1.88]
+三、dsh-ops 没有实现、因此取代不了的部分
+按命令类型的输出过滤（rtk 的主体）：git status/diff/log、cargo test、npm/vitest、pytest、go test、docker ps、kubectl、aws、terraform、tsc、eslint、ruff、mypy 等 100+ 命令各有专用过滤器（去噪/分组/截断/去重）。dsh-ops 只有 4 个文件工具 + 一个通用 bash 执行器，没有这类语义过滤器——在 DSH 里跑 cargo test，输出还是原样的。[citation:web:1.1,1.12,1.47]
+宿主与平台覆盖：rtk 是 agent 无关的，dsh-ops 是 DSH 专属且当前只有 Windows。[citation:web:1.1,1.87]
+集成方式不可互换：rtk 是"透明改写命令"，不改工具契约；dsh-ops 是"新增/替换工具"，模型必须按新工具的参数契约调用。两者不是同一接口，谈不上顶替。
+计量与兜底：rtk gain / discover / session（SQLite 记录每条命令的节省）、失败时 tee 把全量输出存文件只回路径、rtk bypass / RTK_DISABLED=1 单命令绕过；dsh-ops 只有一个只读 TUI 侧栏，没有节省量统计。[citation:web:1.12,1.35]
+更外一层：rtk-proxy 守护进程（压缩 provider API 流量，rtk claude）和 pipeline.toml 引擎，dsh-ops 完全没有对应物。[citation:web:1.1]
+四、反过来，dsh-ops 有 rtk 没有的
+工具定义层瘦身：渐进式披露减少系统提示词里工具定义的占用，还能关闭宿主原版工具省固定 token——rtk 明确不碰内置 Read/Grep/Glob，也不动工具定义（它的钩子只对 Bash 工具调用生效）。[citation:web:1.12]
+真 bash + 随包 PowerShell 7：解决的是"命令本身报错→反复重试"造成的浪费；rtk 只压缩成功命令的输出体积，不降低报错率。[citation:web:1.79,1.87]
+opsbatch / opsresult：批处理预检+审计+可恢复、大结果放引用里分页取（不进上下文）；rtk 的 tee 方向恰好相反。[citation:web:1.75]
+路线图：docx/pdf 轻量化、网页搜索、html→markdown 类工具，靠"模型不用自己写脚本"省 token。
+血缘不同：dsh-ops 的 Rust 工具来自 yc-duan 的 FastCtx（Codex 插件，Apache-2.0），不是 rtk。
+五、两点提醒
+数字口径不可比：rtk 的 60–90% 是bash 输出字节的削减率（按 bytes/4 估算，官方自己强调不等于账单降 90%）；dsh-ops 的 97%/65% 是插件自测，且其 README 自己限定 97% 只代表"提示词全面、明确的单次复杂任务交付"这一场景，严谨 benchmark 待下个版本。别拿两个数字互相印证。[citation:web:1.12,1.49]
+实用判断：如果你在 DSH（尤其 Windows）里，rtk 的支持列表里没有 DSH，本来就装不进去，所以不存在"用 dsh-ops 替掉 rtk"；想两者兼得只能在 ops_bash 里手动调 rtk 二进制，那不是等价集成。如果你在 Claude Code / Cursor / Codex 或 macOS/Linux 上，dsh-ops 根本装不了。真正该选的是宿主，而不是比谁更省。
+
+
+
+已经有人在提这个了 —— 让我看清楚 #3847 和 #3934 到哪一步。
+
+
+
+TL;DR
+
+不是没加 —— 加了的那版比插件弱，而"完整版"没法写在 rtk 里，因为 DSH 的改写点根本不在 rtk 能碰的地方。
+
+上游已经有这条 PR，它只做到"提示"级
+
+#3847 FR: Support DSH —— 09-03 开的，只有 1 条评论，没人接。
+#3934 feat(init): add DeepSeek Harness instruction support —— 09-08 开的，40 天没合，唯一的评论是 CLA 机器人，维护者没审过。
+
+看它的文件清单就知道它是什么：新增的是 hooks/dsh/rtk-awareness.md（22 行）＋ README/supported-agents.md 文档 ＋ src/hooks/init.rs +109 ＋ 一个 Rust 测试。没有任何可执行的适配器——标题里的 "instruction support" 就是字面意思：往 DSH 塞一份"请你调用 rtk"的说明文件，靠模型自觉。它自己的 test plan 也承认 cargo test 8 failed、web 那条 "launcher failed before RTK loading due to a missing FiberState export"。
+
+对比 @banbolee/dsh-rtk：它是真包住 ctx.shell.execute，改写是确定发生的，不依赖模型听话。而且它把 exit-code 契约写对了（A 级，逐行读了 rewrite-decision.js）：mapRtkExit 里 0=改写、2=deny（带 RTK_DENY 类型化失败）、3=ask 时静默执行改写后的命令、1/其它=原样透传。
+
+这个 3 就是整件事的核心陷阱，#3918 的 docs PR 讲得很直白：Claude Code 之外没有任何 settings 文件，PermissionVerdict::Default 映射成 exit 3，所以exit 3 是每个可改写命令的正常返回值；宿主只要把 3 当失败，rtk 就被静默关掉。上游之所以只肯给"提示级"支持，就是为了不替每个宿主重实现这套契约。
+
+完整版为什么写不进 Rust
+
+rtk 的每个 agent 支持都是 src/hooks/init/<agent>.rs 一个文件，干的事是往那个宿主的配置目录写它自己的 hook 格式。插件型宿主（opencode/hermes/pi）确实是 include_str! 内嵌插件源码再改宿主 config.yaml —— 看着像"能照搬到 DSH"，但 DSH 这边要做的不是写一个文件：
+
+目标不是某个固定路径。@deepseek-ai/dsh 的注册点是 Cordis 的 ctx.shell，而启用靠 cordis.patch.yml 加上 package.json 的 dependencies 和 dsh.profile.bundles 三处一致；
+改完必须 pnpm install --ignore-scripts；
+这把操作在 DSH 的 plugin manager 管辖内——它有 pid 锁 run.json、有 10 分钟静默看门狗，你备忘里第①条记的就是绕过 UI 直接改的后果；
+EAC 那条线连状态目录都不是 ~/.dsh：dpx/src/index.js:871 把 DSH_HOME 钉到环境根里。rtk 侧硬编码 ~/.dsh 会写进错的 profile。
+
+也就是说，"给 rtk 加 DSH 支持"的完整版＝在 Rust 里重写一个 DSH 插件管理器，并且从此跟着官方 nightly 的内核跑。这是维护成本问题，不是能力问题；上游选择只出 rtk rewrite 判据接口，让宿主侧自己装饰。
+
+所以插件那条路就是"DSH 支持"
+
+只是它按 DSH 的格式写在 DSH 侧。真想让上游有个 rtk init --agent dsh，有意义的贡献形态是照 hermes 那个模式做：hooks/dsh/ 内嵌 Cordis 插件源码 ＋ 读 DSH_HOME（不能硬编码 ~/.dsh）＋ 注册 cordis.patch.yml ＋ 跑 install。这是几百行的活，还得有人长期跟官方内核。
+
+顺带一个你大概率会撞上的：#4512 —— 在非 Claude 宿主上用 rtk 时"hook nag"会误报且没有 opt-out。
+
+需要你决定
+
+要不要顺手推上游：我可以在 #3847/#3934 下留言，把 @banbolee/dsh-rtk 的装饰器思路和 exit-3 契约、以及"DSH_HOME 不是固定路径"这两条摆出来（这比 #3934 的提示级实现有用）。这会是你名的公开评论，要你说发我才发。
+要不要自己给 rtk 提完整版 PR：上面第 4 节那个形态。工作量和长期维护都在 rtk 侧，收益只是"一条 rtk init 命令"——插件装一次也是永久的。我的建议是不做。
+本轮实际动作：还是先装 winget install rtk-ai.rtk ＋ 在官方那份的插件页装 @banbolee/dsh-rtk，跑一次 git status 看 rtk gain 计数是否增长。要我开始就说。
