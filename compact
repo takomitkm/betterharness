@@ -1,0 +1,6 @@
+https://github.com/deepseek-ai/deepseek-harness/discussions/1933 | 多轮对话后上下文达到上限，无法使用对话，希望加入压缩上下文功能 · deepseek-ai/deepseek-harness · Discussion #1933
+https://github.com/giter00/dsh-headroom | giter00/dsh-headroom: deepSeek harness上下文压缩工具
+https://dsh-plugin.org/zh/plugins/ranxianglei/billion-context | billion-context：AI 编码代理上下文压缩代理 | DSH Plugin
+https://github.com/deepseek-ai/deepseek-harness/discussions/2876 | DSH｜dsh-argp｜双引擎上下文压缩：逐原子守卫缩放 + 引用图确定性剪枝——LLM 只提议、守卫裁决，压缩率精确兑现 · deepseek-ai/deepseek-harness · Discussion #2876
+https://blog.yeyupiaoling.cn/article/1791208764649?lang=en | dsh-idle-compactor: An Idle-Triggered Context Compression Plugin - Yeyupiaoling
+https://segmentfault.com/a/1190000048293816 | 人工智能 - DeepSeek Harness 长任务实战：goal 轮次、/compact 压缩、后台 job 配置全解 - 七牛云行业应用 - SegmentFault 思否
