@@ -1,0 +1,394 @@
+# 一、先确定整体用法
+
+这五个资源不应该全部当作同一种 Skill 安装。它们分别承担不同角色：
+
+| 资源                                                                                                                    | 正确定位        | 主要用法               |
+| --------------------------------------------------------------------------------------------------------------------- | ----------- | ------------------ |
+| [Dean Peters · Product-Manager-Skills](https://github.com/deanpeters/Product-Manager-Skills?utm_source=chatgpt.com)   | 产品管理方法库     | 按任务调用具体 Skill      |
+| [SVPG · Product Model Concepts](https://www.svpg.com/product-model-concepts/?utm_source=chatgpt.com)                  | 产品决策原则      | 制定总控规则、判断方案质量      |
+| [SVPG · Articles](https://www.svpg.com/articles/?utm_source=chatgpt.com)                                              | 方法论与案例资料    | 按问题阅读，补充决策依据       |
+| [Dean Peters · Product Manager Prompts](https://github.com/deanpeters/product-manager-prompts?utm_source=chatgpt.com) | 提示词参考库      | 借鉴提问方式、分析框架和输出结构   |
+| [PM-Skills](https://github.com/product-on-purpose/pm-skills?utm_source=chatgpt.com)                                   | 完整的产品工作流技能库 | 按阶段调用 Skill、工作流和示例 |
+| [Digidai · Product Manager Skills](https://github.com/Digidai/product-manager-skills?utm_source=chatgpt.com)          | 专项产品顾问      | 指标诊断、PRD 审查、路线图与发现 |
+
+这几类资源可以组合，但需要先检查技能重叠、调用方式和许可证。尤其是 SVPG 网站，它是方法论来源，不是一个可直接安装的 Skill。
+
+[image](https://www.google.com/s2/favicons?domain=https://www.svpg.com\&sz=32)
+
+Silicon Valley Product Group
+
++3
+
+
+
+# 二、逐个资源怎么用
+
+## 1. Dean Peters：Product-Manager-Skills
+
+这是最适合当作主技能库的资源。它提供单项技能和组合工作流，既能独立运行，也能根据当前任务跳过不相关的步骤。
+
+[image](https://www.google.com/s2/favicons?domain=https://github.com\&sz=32)
+
+GitHub
+
++1
+
+
+
+### 安装
+
+如果使用 Codex，官方提供了专门的 ZIP 包，内含 `.agents/skills` 和 `AGENTS.md`：
+
+[打开 Releases 下载页](https://github.com/deanpeters/Product-Manager-Skills/releases?utm_source=chatgpt.com)
+
+如果使用 Claude Code，则可以通过插件市场安装：
+
+```
+/plugin marketplace add deanpeters/Product-Manager-Skills
+/plugin install product-manager-skills@pm-skills
+```
+
+### 按任务调用
+
+| 你现在要做什么        | 推荐技能                       |
+| -------------- | -------------------------- |
+| 不确定项目真正要解决什么问题 | `problem-framing-canvas`   |
+| 研究用户需求         | `discovery-interview-prep` |
+| 判断哪个需求优先       | `prioritization-advisor`   |
+| 制定产品路线图        | `roadmap-planning`         |
+| 生成正式需求文档       | `prd-development`          |
+| 拆分大需求          | `epic-breakdown-advisor`   |
+| 编写可验收的用户故事     | `user-story`               |
+| 验证功能是否值得开发     | `pol-probe-advisor`        |
+
+这些是仓库实际列出的技能名称。
+
+[image](https://www.google.com/s2/favicons?domain=https://github.com\&sz=32)
+
+GitHub
+
+
+
+例如，向支持这些 Skills 的代理输入：
+
+```
+Use problem-framing-canvas to analyze my project.
+
+First identify the actual problem, affected users, evidence,
+constraints, and assumptions. Do not jump to a solution.
+Ask only essential clarifying questions.
+```
+
+随后再调用 `prioritization-advisor`，而不是一开始就要求 AI 输出一整套 PRD。
+
+## 2. SVPG：Product Model Concepts
+
+[阅读原文](https://www.svpg.com/product-model-concepts/?utm_source=chatgpt.com)
+
+SVPG 的核心价值不是提供模板，而是约束产品经理的思考方式：先确定要取得什么结果，再决定做什么功能。
+
+它强调的关键概念包括产品战略、赋能型产品团队、产品发现和产品交付。产品发现需要同时考虑客户价值、可用性、技术可行性和商业可行性；产品交付之后还要验证实际结果。
+
+[image](https://www.google.com/s2/favicons?domain=https://www.svpg.com\&sz=32)
+
+Silicon Valley Product Group
+
+
+
+建议把这些原则写进你自己的总控规则，而不是每次都把整篇文章贴给 AI。
+
+例如：
+
+```
+Apply the SVPG product model principles.
+
+Before recommending a feature:
+1. State the desired outcome.
+2. Identify the customer problem and supporting evidence.
+3. Evaluate value, usability, feasibility, and viability.
+4. Separate assumptions from verified facts.
+5. Recommend experiments when important risks remain.
+6. Define how post-release outcomes will be measured.
+
+Do not equate shipping a feature with achieving success.
+```
+
+这段是基于 SVPG 思想整理的自定义规则，不是 SVPG 官方发布的 Skill。
+
+## 3. SVPG：Articles 文章库
+
+[打开文章目录](https://www.svpg.com/articles/?utm_source=chatgpt.com)
+
+这里应该采用按问题检索、阅读、提炼原则的方式，不建议把所有文章一次性塞进上下文。
+
+建议重点关注这些主题：
+
+| 主题                      | 什么时候看             |
+| ----------------------- | ----------------- |
+| Product Management      | 产品经理的职责、需求决策      |
+| Product Discovery       | 判断用户问题、验证解决方案     |
+| Product Strategy        | 定位、竞争优势、战略取舍      |
+| Product Teams           | 产品、设计、工程团队如何协作    |
+| Product Operating Model | 如何建立持续发现、交付和衡量的流程 |
+
+SVPG 的文章目录支持按主题、作者等维度浏览。
+
+[image](https://www.google.com/s2/favicons?domain=https://www.svpg.com\&sz=32)
+
+Silicon Valley Product Group
+
+
+
+可以直接让 AI 执行：
+
+```
+When a product decision requires deeper theoretical grounding:
+
+1. Search SVPG articles for the relevant topic.
+2. Read the original articles, not just search snippets.
+3. Extract the core principle, its assumptions, and limitations.
+4. Translate the principle into a concrete decision rule.
+5. Cite the original article and distinguish its claims
+   from your own recommendations.
+
+Do not treat every SVPG recommendation as universally applicable.
+```
+
+建议产出： 把经过验证的原则整理成 `product-principles.md`，供后续产品决策复用。
+
+## 4. Dean Peters：Product Manager Prompts
+
+[打开仓库](https://github.com/deanpeters/product-manager-prompts?utm_source=chatgpt.com)
+
+这个仓库主要是可直接复制给 AI 的提示词，而不是必须安装的技能包。官方提供了 119 个提示词资产，既有单次任务提示，也有可打包为 Agent Skill 的内容。
+
+[image](https://www.google.com/s2/favicons?domain=https://github.com\&sz=32)
+
+GitHub
+
+
+
+### 使用方法
+
+| 任务            | 去哪里找                         |
+| ------------- | ---------------------------- |
+| 根据调研记录写 PRD   | `prompts/` 中的 PRD 模板         |
+| 分析用户真正的需求     | Jobs-to-be-Done 相关提示词        |
+| 分析竞品          | SWOT、市场分析相关提示词               |
+| 处理临时需求        | `incoming-request-breakdown` |
+| 做上线风险分析       | `premortem`                  |
+| 自己创建可复用提示词    | `prompt-generators/`         |
+| 将提示词包装成 Skill | `skills/`                    |
+
+实际用法就是找到对应文件，阅读完整提示词，再将项目资料提供给 AI 执行。
+
+[image](https://www.google.com/s2/favicons?domain=https://github.com\&sz=32)
+
+GitHub
+
+
+
+例如：
+
+```
+Use the repository's PRD prompt as a reference.
+
+Adapt it to the current project context.
+Ask for missing critical information, distinguish assumptions
+from evidence, and produce a reviewable PRD.
+
+Do not blindly copy the example project or its assumptions.
+```
+
+如果你要自己编写 Skill，可以重点研究 `skills/` 中的 `SKILL.md`、输出模板和示例是怎样配合的。
+
+注意：该仓库目前采用 CC BY-NC-SA 4.0 许可证；如果打算把改编内容用于商业产品，需要先确认授权条件。
+
+[image](https://www.google.com/s2/favicons?domain=https://github.com\&sz=32)
+
+GitHub
+
+
+
+## 5. PM-Skills：完整生命周期工作流
+
+[打开仓库](https://github.com/product-on-purpose/pm-skills?utm_source=chatgpt.com)
+
+这个项目最适合承担标准化的产品工作流程。它提供阶段性 Skills、组合工作流、子代理和大量输出样例。
+
+[image](https://www.google.com/s2/favicons?domain=https://github.com\&sz=32)
+
+GitHub
+
+
+
+### 安装
+
+如果你使用 Codex、Cursor 或其他兼容 Skills CLI 的代理：
+
+```
+npx skills add product-on-purpose/pm-skills
+```
+
+如果使用 Claude Code：
+
+```
+/plugin marketplace add product-on-purpose/agent-plugins
+/plugin install pm-skills@product-on-purpose
+```
+
+这两种安装方式来自项目官方文档。
+
+[image](https://www.google.com/s2/favicons?domain=https://github.com\&sz=32)
+
+GitHub
+
+
+
+### 使用方法
+
+常用命令包括：
+
+```
+/pm-skills:define-problem-statement
+/pm-skills:define-hypothesis
+/pm-skills:deliver-prd
+/pm-skills:deliver-user-stories
+```
+
+例如，一个新功能可以按以下顺序执行：
+
+第一步：定义问题
+
+`/pm-skills:define-problem-statement`
+
+明确用户、现状、问题证据和期望结果。
+
+第二步：提出可验证假设
+
+`/pm-skills:define-hypothesis`
+
+定义假设、验证方法和判断标准。
+
+第三步：生成 PRD
+
+`/pm-skills:deliver-prd`
+
+将已确认的问题和假设转化为正式需求。
+
+第四步：拆分开发需求
+
+`/pm-skills:deliver-user-stories`
+
+生成用户故事和可验收的交付条件。
+
+如果你使用其他代理，不支持这些斜杠命令，就按照仓库的 `SKILL.md` 和工作流说明执行。不要直接假定每个代理都能识别相同的命令。
+
+PM-Skills 使用 Apache-2.0 许可证，比 Dean Peters 两个仓库的非商业共享许可更适合需要进一步改编和集成的项目，但仍应遵守许可证条款。
+
+[image](https://www.google.com/s2/favicons?domain=https://github.com\&sz=32)
+
+GitHub
+
++1
+
+
+
+## 6. Digidai：专项产品顾问
+
+[打开仓库](https://github.com/Digidai/product-manager-skills?utm_source=chatgpt.com)
+
+它适合在已有产品资料的情况下，针对具体问题进行深入分析。项目提供 PRD 审查、SaaS 指标诊断、路线图和产品发现等能力。
+
+[image](https://www.google.com/s2/favicons?domain=https://github.com\&sz=32)
+
+GitHub
+
+
+
+### 安装
+
+```
+npx skills add Digidai/product-manager-skills
+```
+
+### 直接调用的示例
+
+```
+Review this PRD as a critical product peer.
+
+Identify:
+- Incorrect problem framing
+- Missing baseline and target metrics
+- Unsupported assumptions
+- Excessive first-release scope
+- Engineering and delivery risks
+
+Recommend the smallest viable first release.
+Do not rewrite the entire PRD until the critique is complete.
+```
+
+或者：
+
+```
+Review my roadmap.
+
+Identify where stakeholder requests are outweighing evidence.
+Explain the trade-offs and recommend what to defer.
+Do not prioritize features without stating the criteria.
+```
+
+这些调用方式与仓库给出的使用场景一致。
+
+[image](https://www.google.com/s2/favicons?domain=https://github.com\&sz=32)
+
+GitHub
+
+
+
+# 三、把六个资源组合成一套流程
+
+如果你想把它们用于自己的 AI 研发工作流，我建议采用以下分工，而不是让每个资源都从头生成一份产品方案。
+
+### 1. 产品原则
+
+SVPG Concepts + Articles
+
+规定什么是好的产品决策
+
+### 1. 需求发现与判断
+
+Dean Peters Product-Manager-Skills
+
+识别问题、研究用户、评估优先级
+
+### 2. 标准化产品流程
+
+PM-Skills
+
+假设验证、PRD、用户故事、交付
+
+### 3. 独立审查
+
+Digidai + Dean Peters Prompts
+
+挑战需求、查找遗漏、验证输出质量
+
+### 4. 人工确认与研发交接
+
+冻结需求版本，交给架构师和开发代理
+
+这套组合是我建议你自行建立的编排方案，并非上述仓库官方共同维护的工作流。
+
+## 四、建议你实际采用的规则
+
+1. SVPG 只负责原则，不重复写文档。
+2. Dean Peters 负责具体产品判断和专业方法。
+3. PM-Skills 负责阶段流程与标准化产物。
+4. Digidai 负责专项诊断与批判性审查。
+5. Prompts 仓库作为提示词设计参考，不需要将所有提示词都安装成 Skill。
+6. 审查通过后才交接开发；需求变化时更新对应文档，而不是推倒重来。
+
+还有一个容易忽略的问题：你不必把这些仓库全部复制进同一个 Skill 目录。更稳妥的做法是先安装主技能库，再从其余仓库挑选互补能力，避免重名、重复调用和输出规范冲突。
+
+如果你后续要让 AI 使用子代理逐个研究这些仓库，最终产出一份可直接部署的 `product-management-router`，就应该先让子代理分别盘点每个仓库的能力、输入输出、调用方式、依赖和许可证，再统一设计路由规则。
