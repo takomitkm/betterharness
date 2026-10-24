@@ -1,3 +1,10 @@
+| 机制 | 代表 | 怎么省 | 代价 |
+| --- | --- | --- | --- |
+| 命令输出透明改写（hook） | rtk | PreToolUse 截住 git status 之类，改写成 rtk git status，跑真命令后只把压缩结果给模型；git status 压 77–93%、eslint 84%、jest/vitest 94–99% <br>CSDN软件开发网 | 要装 hook，会碰 Bash 工具 |
+| 工具层替换（显式工具契约） | dsh-ops、fastctx | 用自带的 ops_bash/ops_grep/ops_glob/ops_inspect_local_file/ops_replace 顶掉宿主原版工具 <br>CSDN软件开发网<br>；顺带把工具 schema 从 10,700 字节瘦到 7,685（−28.2%）<br>CSDN软件开发网 | 只在 DSH 生效、改工具名 |
+| 代理层压缩 | rtk-proxy、billion-context | 压 provider API 流量 | 要改 base URL |
+| 上下文/工具结果压缩 | dsh-headroom、dsh-argp | post-execute 压工具输出 / 接管 CompactionEngine <br>网页来源 | 只管历史，不管命令输出 |
+
 https://github.com/T-Auto/dsh-ops | T-Auto/dsh-ops: A toolkit for low-level operations in DSH, designed to reduce token usage and task execution time / DSH 底层操作工具插件，旨在减少 Token 消耗与任务耗时
 https://github.com/yc-duan/fastctx | yc-duan/fastctx: Fast, context-efficient repository tools for AI agents (MCP)
 https://github.com/rtk-ai/rtk | rtk-ai/rtk: CLI proxy that reduces LLM token consumption by 60-90% on common dev commands. Single Rust binary, zero dependencies
