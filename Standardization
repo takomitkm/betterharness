@@ -1,11 +1,8 @@
 sop
 https://chatgpt.com/c/6ad31d9c-3cf8-83ea-b36c-bcca3321e5cd | Agent SOP工具推荐
 https://d3ehv1nix5p99z.cloudfront.net/pr-cms-4813/docs/user-guide/evals-sdk/eval-sop/?utm_source=chatgpt.com | Evaluate with AI | Strands Agents
-https://kuku.baidu.com/app?_at_=1789000643662#/workbench/new-task?session_id=9c11fa1338953086bceb19e8b8f67c1cfbd6eebe&message_id=8fdb924e2d876e1aff00bed5b9f3f90f77c64df3 | 库库AI
-https://kuku.baidu.com/app?_at_=1789000643662#/workbench/new-task?session_id=d05b73afd974ef06eff9aef8941ea76e59fa4a51&message_id=aae10b6fc07859fb770bf78a6529647d272834e2 | 库库AI
-https://pypi.org/project/biz-dfch-asdste100vocab/0.8.1/ | biz-dfch-asdste100vocab · PyPI
-https://kuku.baidu.com/app?_at_=1789000643662#/workbench/new-task?session_id=20cb913f1543a7c30c22590102020740bf1ecd5b&message_id=89a07cdedbd3cd22bcd126fff705cc1754275f42 | 库库AI
-https://kuku.baidu.com/app?_at_=1789000643662#/workbench/new-task?session_id=e5ad7a316475a22d7375a417866fb84ae45cc337&message_id=ce0ae62a205253ea551810a6f524ccbff121ca8a | 库库AI
+
+需求文档上叠 EARS，所有文档走 prose 闸门，CI 里跑 Vale增加可读性，asd-ste做程序步骤（人用SOP）
 
 docs
 https://github.com/danyuchn/asd-ste100-skill | danyuchn/asd-ste100-skill: ASD-STE100 Simplified Technical English rules, repurposed as a Claude Code skill for rewriting ambiguous agent-facing English.
