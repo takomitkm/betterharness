@@ -5,6 +5,8 @@
 | 代理层压缩 | rtk-proxy、billion-context | 压 provider API 流量 | 要改 base URL |
 | 上下文/工具结果压缩 | dsh-headroom、dsh-argp | post-execute 压工具输出 / 接管 CompactionEngine <br>网页来源 | 只管历史，不管命令输出 |
 
+两者作用的位置不同。rtk 换掉的是“命令字符串”（模型看不见替换这件事），dsh-ops 换掉的是“工具名”（模型看得见并在调用里写出来）。两者都在为了节省 token 而压缩输出，但 rtk 在透明层做有损替换，出了事没人担责任；dsh-ops 在自己的工具里做有界输出，连接口约定都写在 schema 里。
+
 https://github.com/T-Auto/dsh-ops | T-Auto/dsh-ops: A toolkit for low-level operations in DSH, designed to reduce token usage and task execution time / DSH 底层操作工具插件，旨在减少 Token 消耗与任务耗时
 https://github.com/yc-duan/fastctx | yc-duan/fastctx: Fast, context-efficient repository tools for AI agents (MCP)
 https://github.com/rtk-ai/rtk | rtk-ai/rtk: CLI proxy that reduces LLM token consumption by 60-90% on common dev commands. Single Rust binary, zero dependencies
