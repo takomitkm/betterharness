@@ -55,6 +55,13 @@ const type = (v: string) =>
     el.dispatchEvent(new Event("input", { bubbles: true }));
   });
 
+function unmount() {
+  act(() => {
+    root?.unmount();
+  });
+  root = null;
+}
+
 /** 派发 keydown，返回合成事件是否 preventDefault（React 会转发到原生事件） */
 function keyDown(k: string, init: KeyboardEventInit = {}) {
   const ev = new KeyboardEvent("keydown", {
