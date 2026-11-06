@@ -40,12 +40,21 @@ function mount(props: Parameters<typeof ChatComposer>[0] = {}) {
 
 const ta = () => host.querySelector("textarea") as HTMLTextAreaElement;
 const failedItems = () => host.querySelectorAll(".chat-composer__failed li");
+
+// React 对受控 textarea 安装了 value tracker：直接 el.value = v 后 dispatch input
+// 不会触发 onChange，必须走原型上的 native value setter（fireEvent.change 的内部做法）。
+const nativeValueSetter = Object.getOwnPropertyDescriptor(
+  window.HTMLTextAreaElement.prototype,
+  "value",
+)!.set!;
+
 const type = (v: string) =>
   act(() => {
     const el = ta();
-    el.value = v;
+    nativeValueSetter.call(el, v);
     el.dispatchEvent(new Event("input", { bubbles: true }));
   });
+
 /** 派发 keydown，返回合成事件是否 preventDefault（React 会转发到原生事件） */
 function keyDown(k: string, init: KeyboardEventInit = {}) {
   const ev = new KeyboardEvent("keydown", {
@@ -111,23 +120,25 @@ describe("ChatComposer 渲染层（真实 React 19 + jsdom）", () => {
     expect(ta().value).toBe("");
   });
 
-  it("R4 Shift+Enter：显式换行进编辑器，不发送", () => {
+  it("R4 Shift+Enter：不被消费（换行由编辑器默认行为负责），不发送", () => {
     const sent: string[] = [];
     mount({ onSubmit: async (t) => { sent.push(t); } });
     type("L1");
-    keyDown("Enter", { shiftKey: true });
+    const r = keyDown("Enter", { shiftKey: true });
+    expect(r.defaultPrevented).toBe(false); // 显式换行不被吞
+    type("L1\n"); // jsdom 不模拟按键插入文本，手动等价模拟浏览器的换行结果
     type("L2");
     expect(ta().value).toBe("L1\nL2");
     expect(sent.length).toBe(0);
   });
 
-  it("R5 IME 组合中回车：不发送、不消费", () => {
+  it("R5 IME 组合中回车：不发送、不被消费", () => {
     const sent: string[] = [];
     mount({ onSubmit: async (t) => { sent.push(t); } });
     type("nihao");
     const r = keyDown("Enter", { isComposing: true });
     expect(sent.length).toBe(0);
-    expect(r.defaultPrevented).toBe(false);
+    expect(r.defaultPrevented).toBe(false); // IME 组合中不拦（回车确认候选）
   });
 
   it("R6 空输入回车：不发送", () => {
