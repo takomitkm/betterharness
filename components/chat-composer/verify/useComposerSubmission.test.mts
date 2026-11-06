@@ -13,7 +13,7 @@ const onSubmit = (t: string) => {
   return rejectNext ? Promise.reject(new Error("send-failed")) : Promise.resolve();
 };
 
-function render() { startRender(); return useComposerSubmission(onSubmit); }
+function render() { startRender(); return useComposerSubmission({ onSubmit }); }
 
 // 1) 空文本 submit → 不发送
 submitted = [];
