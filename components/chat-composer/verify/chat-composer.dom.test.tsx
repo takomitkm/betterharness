@@ -138,7 +138,6 @@ describe("ChatComposer 渲染层（真实 React 19 + jsdom）", () => {
     // （实测回滚到最后一次输入），真实浏览器的效果见 demo.html；
     // 持久化流转用单行草稿在 R11–R13 验证。
   });
-  });
 
   it("R5 IME 组合中回车：不发送、不被消费", () => {
     const sent: string[] = [];
