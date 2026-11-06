@@ -1,6 +1,6 @@
 # chat-composer —— 聊天输入框该怎么写
 
-来源：ZCode 桌面端 v3.17.2 的「快速双击回车 → 消息已发出但输入框残留原文+换行」bug（[zai-org/feedback#1415](https://github.com/zai-org/feedback/issues/1415)）。修复过程中把"一个聊天输入框必须写对的几条规则"沉淀成了这套自包含参考实现：`useComposerSubmission.ts` 是提交状态机，`ChatComposer.tsx` 是展示壳，`demo.html` 是可以打开就玩的四实现对比页。
+来源：ZCode 桌面端 v3.17.2 的「快速双击回车 → 消息已发出但输入框残留原文+换行」bug（[zai-org/feedback#1415](https://github.com/zai-org/feedback/issues/1415)）。修复过程中把"一个聊天输入框必须写对的几条规则"沉淀成了这套自包含参考实现：`useComposerSubmission.ts` 是提交状态机，`ChatComposer.tsx` 是展示壳，`demo.html` 是可以打开就玩的五模式对比页。
 
 ## 先记住唯一的时序图
 
@@ -45,7 +45,8 @@ ZCode 3.17.2 的 bug 就是①③②三条叠加：提交在途 → Enter 被放
 |---|---|
 | [`useComposerSubmission.ts`](./useComposerSubmission.ts) | 提交状态机 hook：Enter 语义、在途锁、受理即清空、失败恢复。零依赖。 |
 | [`ChatComposer.tsx`](./ChatComposer.tsx) | 展示壳：textarea + 失败项提示 + 发送按钮。React 19，无其他依赖。 |
-| [`demo.html`](./demo.html) | 双击打开就能玩的对比页：四种实现（ZCode 修复版 / ZCode 原版 / Codex / Claude Code）+ 可调时序 + 事件日志。27 项自动化断言全部通过。 |
+| [`demo.html`](./demo.html) | 双击打开就能玩的对比页：五种实现（ZCode 修复版 / ZCode 原版 / Codex / Claude Code / DSH）+ 可调时序 + 事件日志。35 项自动化断言全部通过。 |
+| [`verify/demo-playwright.mjs`](./verify/demo-playwright.mjs) | demo 断言的可复现脚本：`node demo-playwright.mjs`（需 playwright-core；浏览器通道默认 msedge，`CE_BROWSER_CHANNEL` 可覆盖）。 |
 
 ## 用法
 
@@ -64,7 +65,7 @@ import { ChatComposer } from "./components/chat-composer/ChatComposer.js";
 
 ## 验证记录
 
-- `demo.html`：27 项 Playwright 断言（四种模式 × 双击/排队/失败恢复/Shift+Enter），真实 Edge 全部通过
+- `demo.html`：35 项 Playwright 断言（五种模式 × 双击/在途锁/排队/失败恢复/↑ 取回/Shift+Enter），真实 Edge headless 全部通过——复现：`cd verify && node demo-playwright.mjs`
 - 真实 ZCode 应用（fork [`full-handoff` 分支](https://github.com/takomitkm/ZCode/tree/full-handoff)，[`250e6ed8`](https://github.com/takomitkm/ZCode/commit/250e6ed8)，diff 见 [compare](https://github.com/takomitkm/ZCode/compare/a9fe401...250e6ed8)）：新增用例 2 passing；官方结算套件 CST01–05 5 passing 无回归；两次变异校准分别命中"清空契约"与"Enter 契约"
 
 ## turn 生命周期、队列与草稿持久化（已实现）
