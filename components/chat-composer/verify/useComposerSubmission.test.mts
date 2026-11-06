@@ -1,5 +1,6 @@
 import { startRender, useState as _unused } from "./react-shim.mjs";
 void _unused;
+await import("./gen-hook.mjs");
 const { useComposerSubmission } = await import("./hook-gen.ts");
 
 const results: Array<{ name: string; pass: boolean; detail?: string }> = [];

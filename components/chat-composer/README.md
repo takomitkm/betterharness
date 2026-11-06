@@ -67,8 +67,16 @@ import { ChatComposer } from "./components/chat-composer/ChatComposer.js";
 - `demo.html`：27 项 Playwright 断言（四种模式 × 双击/排队/失败恢复/Shift+Enter），真实 Edge 全部通过
 - 真实 ZCode 应用（fork [`full-handoff` 分支](https://github.com/takomitkm/ZCode/tree/full-handoff)，[`250e6ed8`](https://github.com/takomitkm/ZCode/commit/250e6ed8)，diff 见 [compare](https://github.com/takomitkm/ZCode/compare/a9fe401...250e6ed8)）：新增用例 2 passing；官方结算套件 CST01–05 5 passing 无回归；两次变异校准分别命中"清空契约"与"Enter 契约"
 
-## 还没做（扩展点）
+## turn 生命周期、队列与草稿持久化（已实现）
 
-- **模型生成中的排队/插话**：ZCode 走 `inputRouting`（queue/guide），Codex 是 Enter=steer、Tab=queue，Claude Code 入队后 `↑` 取回。demo.html 里有演示，hook 未实现。
-- **草稿持久化**：ZCode 会把没发完的草稿落盘并在重开会话时恢复；恢复时记得和"已发送正文"区分开（否则会像原 bug 一样复活已发内容）。
-- **富文本**：mention / 斜杠命令建议直接上 Lexical，`$getPromptMarkdown()` 取纯文本交给本 hook 即可。
+- **turn 生命周期**：宿主调 `beginTurn()`（模型开始生成）/ `endTurn()`（本轮结束）驱动。`endTurn` 时队列非空则自动逐条发出。
+- **生成中按 Enter**：由 `busyEnter` 选项路由——`"queue"`（默认，ZCode/Claude Code 语义：入队、清空编辑器）、`"steer"`（Codex 语义：直接发送并入当前轮）、`"none"`（保留草稿不投递）。
+- **↑ 取回**：`popQueueToEditor()`——编辑器为空且队列非空时取回最近排队的一条；编辑器非空时绝不覆盖。
+- **草稿持久化**：传 `draftKey`（可选 `draftDebounceMs`，默认 350 ms）后草稿防抖落盘、挂载时恢复。**受理会同步清空草稿（不等防抖）**——这是 ZCode bug 的另一半：残留被当草稿落盘后，刷新页面会把已发出的正文复活进输入框。
+- 验证：`verify/turn-and-draft.test.mts` 27 项断言（排队多条、steer、none、↑ 取回、防抖落盘、重挂载恢复、受理同步清空、失败路径），Deno 全部通过。
+
+运行：`deno run --allow-read verify/turn-and-draft.test.mts`（或 `node verify/gen-hook.mjs && npx tsx verify/turn-and-draft.test.mts`）。
+
+## 还没做
+
+- **富文本**：mention / 斜杠命令建议直接上 Lexical（ZCode 的做法），`$getPromptMarkdown()` 取纯文本交给本 hook 即可——键盘语义与提交状态机不变。

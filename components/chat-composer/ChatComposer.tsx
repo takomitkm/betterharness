@@ -16,6 +16,10 @@ import { useComposerSubmission } from "./useComposerSubmission.js";
 export interface ChatComposerProps {
   onSubmit?: (text: string) => Promise<void>;
   placeholder?: string;
+  /** 模型生成中按 Enter 的投递方式；默认 queue（ZCode 语义），可选 steer / none */
+  busyEnter?: "queue" | "steer" | "none";
+  /** 设置后草稿防抖落盘（localStorage），挂载时恢复；受理同步清空草稿 */
+  draftKey?: string;
   /** 状态条与失败项的中文文案开关；默认中文 */
   labels?: Partial<typeof DEFAULT_LABELS>;
 }
@@ -28,9 +32,15 @@ const DEFAULT_LABELS = {
   dismiss: "放弃",
 };
 
-export function ChatComposer({ onSubmit = async () => {}, placeholder = "", labels }: ChatComposerProps) {
+export function ChatComposer({
+  onSubmit = async () => {},
+  placeholder = "",
+  busyEnter = "queue",
+  draftKey,
+  labels,
+}: ChatComposerProps) {
   const L = { ...DEFAULT_LABELS, ...labels };
-  const c = useComposerSubmission(onSubmit);
+  const c = useComposerSubmission({ onSubmit, busyEnter, draftKey });
 
   return (
     <div className="chat-composer">
@@ -57,6 +67,11 @@ export function ChatComposer({ onSubmit = async () => {}, placeholder = "", labe
         onChange={(e) => c.setText(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === "Enter") c.handleEnter(e);
+          // ↑：编辑器为空且队列非空时，取回最近排队的一条
+          if (e.key === "ArrowUp" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+            const back = c.popQueueToEditor();
+            if (back !== null) e.preventDefault();
+          }
         }}
         placeholder={placeholder}
         rows={3}
@@ -64,8 +79,18 @@ export function ChatComposer({ onSubmit = async () => {}, placeholder = "", labe
       />
 
       <div className="chat-composer__bar">
-        <span className="chat-composer__hint">{c.inFlight ? L.hintBusy : L.hintIdle}</span>
-        <button type="button" onClick={() => c.submit()} disabled={c.inFlight || !c.text.trim()}>
+        <span className="chat-composer__hint">
+          {c.inFlight
+            ? L.hintBusy
+            : c.isGenerating
+              ? "生成中…（Enter 排队 / ↑ 取回队列）"
+              : L.hintIdle}
+        </span>
+        <button
+          type="button"
+          onClick={() => c.submit()}
+          disabled={c.inFlight || !c.text.trim()}
+        >
           发送
         </button>
       </div>
