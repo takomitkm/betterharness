@@ -223,7 +223,8 @@ describe("ChatComposer 渲染层（真实 React 19 + jsdom）", () => {
       (buttons[1] as HTMLButtonElement).click();
     });
     expect(failedItems().length).toBe(0);
-    expect(ta().value).toBe("");
+    // 放弃语义：失败条目消失，编辑器保留正文（用户可自行编辑后再发）
+    expect(ta().value).toBe("give-up");
   });
 
   it("R11 草稿持久化：防抖落盘 + 受理同步清空 + 发送成功后不复活", async () => {

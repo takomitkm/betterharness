@@ -283,8 +283,25 @@ export function useComposerSubmission(
       setFailed((f) => {
         const item = f.find((x) => x.id === id);
         if (!item) return f;
-        if (textRef.current.trim() === "") {
-          setText(item.text);
+        // 受理即清空语义与普通提交一致：
+        // - 编辑器内容就是失败原文（失败恢复搬回来的）→ 重发并清空编辑器；
+        // - 编辑器已被用户改写 → 后台原样重发，绝不覆盖用户新输入。
+        if (textRef.current === item.text) {
+          setText("");
+          inFlightRef.current = true;
+          setInFlight(true);
+          void (async () => {
+            try {
+              await onSubmit(item.text);
+              setSentCount((n) => n + 1);
+            } catch {
+              setFailed((prev) => [...prev, item]);
+              if (textRef.current.trim() === "") setText(item.text);
+            } finally {
+              inFlightRef.current = false;
+              setInFlight(false);
+            }
+          })();
         } else {
           void (async () => {
             try {

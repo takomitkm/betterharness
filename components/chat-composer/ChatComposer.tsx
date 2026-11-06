@@ -66,7 +66,17 @@ export function ChatComposer({
         value={c.text}
         onChange={(e) => c.setText(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Enter") c.handleEnter(e);
+          if (e.key === "Enter") {
+            // React 合成事件不代理 isComposing——必须读 nativeEvent（ZCode 原版同款要点）
+            c.handleEnter({
+              key: e.key,
+              shiftKey: e.shiftKey,
+              ctrlKey: e.ctrlKey,
+              metaKey: e.metaKey,
+              isComposing: e.nativeEvent.isComposing,
+              preventDefault: () => e.preventDefault(),
+            });
+          }
           // ↑：编辑器为空且队列非空时，取回最近排队的一条
           if (e.key === "ArrowUp" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
             const back = c.popQueueToEditor();
