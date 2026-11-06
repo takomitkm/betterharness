@@ -1,196 +1,307 @@
-// demo.html 的 Playwright 断言脚本（可 clone 复现 README「验证记录」里的浏览器数字）。
-//
-// 运行：cd components/chat-composer/verify && node demo-playwright.mjs
-// 依赖：playwright-core（npm i playwright-core，或用 CE_PLAYWRIGHT_PATH 指向已有安装）；
-//       浏览器通道默认 msedge，可用 CE_BROWSER_CHANNEL=chrome 等覆盖。
-// 流程：读取仓库内 ../demo.html（Gen-UI 片段），包一层完整 HTML 写入系统临时目录，
-//       用 file:// 打开后跑断言；不往仓库写任何文件。
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { readFileSync, writeFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { chromium as installedChromium } from 'playwright-core';
+import { startDemoServer } from './demo-server.mjs';
 
-const demoPath = new URL('../demo.html', import.meta.url);
+let server;
+let browser;
+before(async () => {
+  server = await startDemoServer();
+  const chromium = process.env.CE_PLAYWRIGHT_PATH
+    ? createRequire(import.meta.url)(process.env.CE_PLAYWRIGHT_PATH).chromium : installedChromium;
+  browser = await chromium.launch({ channel: process.env.CE_BROWSER_CHANNEL || (process.platform === 'win32' ? 'msedge' : undefined), headless: true });
+});
+after(async () => { await browser?.close(); await server?.close(); });
 
-// —— playwright-core 解析：环境变量 → 就近 require → 校机已知路径 ——
-function loadPlaywright() {
-  const candidates = [];
-  if (process.env.CE_PLAYWRIGHT_PATH) candidates.push(process.env.CE_PLAYWRIGHT_PATH);
-  try {
-    return { chromium: createRequire(import.meta.url)('playwright-core').chromium };
-  } catch { /* fallthrough */ }
-  candidates.push('D:/yzd/zcode-e2e/ZCode/node_modules/playwright-core');
-  for (const c of candidates) {
-    try {
-      return { chromium: createRequire(import.meta.url)(c).chromium };
-    } catch { /* try next */ }
-  }
-  console.error('playwright-core 未找到：npm i playwright-core，或设 CE_PLAYWRIGHT_PATH=<路径>/playwright-core');
-  process.exit(2);
+async function openPage(t, { editor = 'text', context, scope = crypto.randomUUID() } = {}) {
+  const owned = !context;
+  context ??= await browser.newContext();
+  const page = await context.newPage();
+  const errors = [];
+  page.on('pageerror', (error) => errors.push(String(error)));
+  t.after(async () => { assert.deepEqual(errors, [], 'No uncaught React/browser errors'); if (owned) await context.close(); else await page.close(); });
+  await page.goto(`${server.url}?scope=${encodeURIComponent(scope)}&editor=${editor}&timeout=5000`);
+  await page.waitForFunction(() => Boolean(window.composerTest));
+  return { page, context, scope };
+}
+const editorOf = (page) => page.getByTestId('editor');
+const textOf = (page) => page.evaluate(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.text);
+const rowsOf = (page) => page.evaluate(() => window.composerTest.engine.getSnapshot().state.submissions.map(({ id, status, snapshot }) => ({ id, status, text: snapshot.text })));
+async function type(page, text) {
+  await editorOf(page).fill(text);
+  await page.waitForFunction((text) => {
+    const view = window.composerTest.engine.getSnapshot();
+    return view.state.draft.snapshot.text === text && !view.dirty;
+  }, text);
+}
+async function waitStatus(page, status, index = 0) {
+  await page.waitForFunction(({ status, index }) => window.composerTest.engine.getSnapshot().state.submissions[index]?.status === status, { status, index });
+}
+async function messages(page, scope) {
+  return page.evaluate(async (scope) => (await (await fetch('api/stats')).json()).messages.filter((message) => message.scopeId === scope), scope);
+}
+async function send(page, text, scenario = 'normal') {
+  await page.getByTestId('scenario').selectOption(scenario);
+  await type(page, text);
+  await editorOf(page).press('Enter');
+}
+async function held(page) {
+  await page.waitForFunction(async () => (await (await fetch('api/stats')).json()).held > 0);
 }
 
-const { chromium } = loadPlaywright();
-const channel = process.env.CE_BROWSER_CHANNEL || 'msedge';
+test('B01: real React double Enter during a held receipt sends A exactly once with no leftover line', async (t) => {
+  const { page, scope } = await openPage(t);
+  await send(page, 'A', 'hold');
+  await held(page);
+  assert.equal(await textOf(page), '');
+  await editorOf(page).press('Enter');
+  assert.equal(await textOf(page), '');
+  await page.getByTestId('release').click();
+  await waitStatus(page, 'accepted');
+  assert.equal((await messages(page, scope)).length, 1);
+  assert.equal(await editorOf(page).inputValue(), '');
+});
 
-// —— 片段包壳 ——
-const fragment = readFileSync(demoPath, 'utf8');
-const pageHtml = `<!doctype html><html><head><meta charset="utf-8"><style>
-body{background:#fff;color:#111;font:14px system-ui;padding:16px}
-#ce-lab{display:flex;flex-direction:column;gap:10px;max-width:720px}
-button{padding:4px 8px}textarea{width:100%;min-height:76px;font-family:monospace}
-#ce-log{max-height:220px;overflow:auto;padding-left:1.4em}
-</style></head><body>${fragment}</body></html>`;
-const outFile = join(tmpdir(), 'betterharness-ce-standalone.html');
-writeFileSync(outFile, pageHtml, 'utf8');
-
-const results = [];
-const check = (name, cond, detail) => results.push({ name, pass: !!cond, detail: detail === undefined ? '' : String(detail) });
-
-const browser = await chromium.launch({ channel, headless: true });
-const page = await browser.newPage();
-page.on('pageerror', (e) => results.push({ name: 'PAGEERROR', pass: false, detail: String(e) }));
-await page.goto(pathToFileURL(outFile).href);
-
-const readText = () => page.textContent('#ce-text');
-const readCounts = () => page.textContent('#ce-counts');
-const readLog = () => page.textContent('#ce-log');
-const readPhase = () => page.textContent('#ce-phase');
-const setRange = (id, v) => page.evaluate(({ id, v }) => {
-  const el = document.getElementById(id);
-  el.value = String(v);
-  el.dispatchEvent(new Event('input', { bubbles: true }));
-}, { id, v });
-const pickMode = (m) => page.click('[data-mode="' + m + '"]');
-const resetCase = () => page.click('#ce-reset');
-
-await setRange('ce-accept', 300);
-await setRange('ce-gen', 900);
-
-// A. 在途窗口内双击（四家差异点）
-const dblExpect = [
-  ['zcode-fix', '""'],
-  ['zcode-3172', '"A\\n"'],
-  ['codex', '""'],
-  ['cc', '""'],
-];
-let fixLog = '';
-let legacyLog = '';
-for (const pair of dblExpect) {
-  const mode = pair[0];
-  const expect = pair[1];
-  await pickMode(mode);
-  await resetCase();
-  await page.fill('#ce-editor', 'A');
-  await page.click('#ce-dbl');
-  await page.waitForTimeout(1500);
-  check(mode + ': 双击后编辑器', (await readText()) === expect, await readText());
-  check(mode + ': 只发 1 条', (await readCounts()).startsWith('1 /'), await readCounts());
-  if (mode === 'zcode-fix') fixLog = await readLog();
-  if (mode === 'zcode-3172') legacyLog = await readLog();
-}
-check('3172: 日志点名 BUG', legacyLog.includes('残留'), '');
-check('fix: 在途 no-op 文案', fixLog.includes('no-op'), '');
-
-// A2. DSH：在途锁编辑器（只读 + 保留草稿），Host 受理后才清空
-await pickMode('dsh');
-await resetCase();
-await page.fill('#ce-editor', 'A');
-await page.click('#ce-dbl');
-await page.waitForTimeout(90);
-check('dsh: 在途编辑器只读', await page.$eval('#ce-editor', (el) => el.readOnly === true), '');
-check('dsh: 在途保留草稿（不清空）', (await readText()) === '"A"', await readText());
-await page.waitForTimeout(1600);
-check('dsh: Host 受理后清空', (await readText()) === '""', await readText());
-check('dsh: 只发 1 条', (await readCounts()).startsWith('1 /'), await readCounts());
-check('dsh: 日志点名只读锁', (await readLog()).includes('只读'), '');
-
-// A3. DSH 生成中按 Enter → 排队
-await pickMode('dsh');
-await resetCase();
-await page.fill('#ce-editor', 'A');
-await page.click('#ce-send');
-await page.waitForTimeout(500);
-check('dsh: 已进入生成中', (await readPhase()).includes('模型生成中'), await readPhase());
-await page.fill('#ce-editor', 'B');
-await page.click('#ce-send');
-check('dsh: 生成中排队 → 队列 1', (await readCounts()).endsWith('/ 1'), await readCounts());
-await page.waitForTimeout(2800);
-check('dsh: 队列轮末发出', (await readCounts()).startsWith('2'), await readCounts());
-
-// B. 模型生成中按 Enter：ZCode 两版都应排队
-for (const mode of ['zcode-fix', 'zcode-3172']) {
-  await pickMode(mode);
-  await resetCase();
-  await page.fill('#ce-editor', 'A');
-  await page.click('#ce-send');
-  await page.waitForTimeout(420);
-  check(mode + ': 已进入生成中', (await readPhase()).includes('模型生成中'), await readPhase());
-  await page.fill('#ce-editor', 'B');
-  await page.click('#ce-send');
-  check(mode + ': 生成中排队 → 队列 1', (await readCounts()).endsWith('/ 1'), await readCounts());
-  check(mode + ': 排队后框清空', (await readText()) === '""', await readText());
-  check(mode + ': 日志显示排队', (await readLog()).includes('排队'), '');
-  await page.waitForTimeout(2800);
-  check(mode + ': 队列在轮末自动发出', (await readCounts()).startsWith('2'), await readCounts());
+for (const text of ['B-new', 'A', ' \n']) {
+  test(`B02: late admission preserves the successor draft ${JSON.stringify(text)}`, async (t) => {
+    const { page } = await openPage(t);
+    await send(page, 'A', 'hold'); await held(page);
+    await type(page, text);
+    await page.getByTestId('release').click(); await waitStatus(page, 'accepted');
+    assert.equal(await textOf(page), text);
+    await page.reload(); await page.waitForFunction(() => Boolean(window.composerTest));
+    assert.equal(await textOf(page), text);
+  });
 }
 
-// C. Codex / CC 生成中
-await pickMode('codex');
-await resetCase();
-await page.fill('#ce-editor', 'A');
-await page.click('#ce-send');
-await page.waitForTimeout(420);
-await page.fill('#ce-editor', 'B');
-await page.click('#ce-send');
-check('codex: 生成中 → steer', (await readLog()).includes('steer'), '');
-await page.waitForTimeout(1700);
+test('B03: actual lost HTTP acknowledgement is unknown; lookup confirms without a second send', async (t) => {
+  const { page, scope } = await openPage(t);
+  await send(page, 'only once', 'lost-ack');
+  await waitStatus(page, 'unknown');
+  assert.equal(await textOf(page), '');
+  assert.equal(await page.getByRole('button', { name: '原样重试' }).count(), 0);
+  await page.getByRole('button', { name: '核对送达状态' }).click();
+  await waitStatus(page, 'accepted');
+  assert.equal((await messages(page, scope)).length, 1);
+});
 
-await pickMode('cc');
-await resetCase();
-await page.fill('#ce-editor', 'A');
-await page.click('#ce-send');
-await page.waitForTimeout(420);
-await page.fill('#ce-editor', 'B');
-await page.click('#ce-send');
-check('cc: 生成中 → 入队', (await readLog()).includes('queuedCommands'), '');
-await page.focus('#ce-editor');
-await page.keyboard.press('ArrowUp');
-check('cc: ↑ 取回', (await readText()) === '"B"', await readText());
-await page.waitForTimeout(1700);
+test('B04: renderer restart keeps uncertain A and new draft B in actual IndexedDB', async (t) => {
+  const { page, scope } = await openPage(t);
+  await send(page, 'A', 'hold'); await held(page);
+  await type(page, 'B');
+  await page.reload(); await page.waitForFunction(() => Boolean(window.composerTest));
+  await waitStatus(page, 'unknown');
+  assert.equal(await textOf(page), 'B');
+  assert.equal((await messages(page, scope)).length, 1);
+  await page.getByRole('button', { name: '核对送达状态' }).click(); await waitStatus(page, 'accepted');
+  assert.equal(await textOf(page), 'B');
+});
 
-// D. 失败恢复
-await pickMode('zcode-fix');
-await resetCase();
-await page.check('#ce-fail');
-await page.fill('#ce-editor', 'X');
-await page.click('#ce-send');
-await page.waitForTimeout(1700);
-check('fix: 失败恢复原文', (await readText()) === '"X"', await readText());
+test('B05: explicit rejection has a separate recovery action and cannot replace whitespace or B', async (t) => {
+  const { page } = await openPage(t);
+  await send(page, 'A', 'reject'); await waitStatus(page, 'rejected');
+  assert.equal(await textOf(page), '');
+  await type(page, 'B');
+  assert.equal(await page.getByRole('button', { name: '取回编辑', exact: true }).isDisabled(), true);
+  await type(page, ' \n');
+  assert.equal(await page.getByRole('button', { name: '取回编辑', exact: true }).isDisabled(), true);
+  await type(page, '');
+  await page.getByRole('button', { name: '取回编辑', exact: true }).click();
+  await page.waitForFunction(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.text === 'A');
+  assert.equal((await rowsOf(page))[0].status, 'cancelled');
+});
 
-// E. 失败 + 新草稿不被覆盖
-await pickMode('zcode-fix');
-await resetCase();
-await page.check('#ce-fail');
-await page.fill('#ce-editor', 'A');
-await page.click('#ce-send');
-await page.waitForTimeout(420);
-await page.fill('#ce-editor', 'B-new');
-await page.waitForTimeout(1700);
-check('fix: 新草稿保留', (await readText()) === '"B-new"', await readText());
-check('fix: A 记为失败项', (await readCounts()).includes('/ 1 /'), await readCounts());
+test('B06: actual Lexical mention + file bytes restore together and survive a reload', async (t) => {
+  const { page } = await openPage(t, { editor: 'rich' });
+  await page.getByTestId('mention').click();
+  await page.waitForFunction(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.references.length === 1);
+  await page.getByTestId('files').setInputFiles({ name: '资料.txt', mimeType: 'text/plain', buffer: Buffer.from('真实附件字节') });
+  await page.waitForFunction(() => {
+    const view = window.composerTest.engine.getSnapshot(); return !view.dirty && view.state.draft.snapshot.attachments.length === 1;
+  });
+  await page.getByTestId('scenario').selectOption('reject');
+  await editorOf(page).press('Enter'); await waitStatus(page, 'rejected');
+  assert.equal(await textOf(page), '');
+  await page.getByRole('button', { name: '取回编辑', exact: true }).click();
+  await page.locator('[data-testid=editor] .mention').waitFor();
+  assert.equal(await page.evaluate(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.attachments[0].data.text()), '真实附件字节');
+  await page.reload(); await page.waitForFunction(() => Boolean(window.composerTest));
+  await page.locator('[data-testid=editor] .mention').waitFor();
+  assert.equal(await page.evaluate(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.attachments[0].data.text()), '真实附件字节');
+});
 
-// F. Shift+Enter 显式换行
-await pickMode('zcode-fix');
-await resetCase();
-await page.fill('#ce-editor', 'L1');
-await page.keyboard.press('Shift+Enter');
-await page.keyboard.type('L2');
-check('fix: Shift+Enter 换行', (await readText()) === '"L1\\nL2"', await readText());
+test('B07: attachment-only submission owns the bytes once and has no residual editor attachment', async (t) => {
+  const { page, scope } = await openPage(t);
+  await page.getByTestId('files').setInputFiles({ name: 'only.txt', mimeType: 'text/plain', buffer: Buffer.from('only-file') });
+  await page.waitForFunction(() => !window.composerTest.engine.getSnapshot().dirty);
+  await editorOf(page).press('Enter'); await waitStatus(page, 'accepted');
+  const records = await messages(page, scope);
+  assert.equal(records.length, 1);
+  assert.equal(Buffer.from(records[0].snapshot.attachments[0].bytes, 'base64').toString(), 'only-file');
+  assert.equal(await page.evaluate(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.attachments.length), 0);
+});
 
-await browser.close();
-try { rmSync(outFile); } catch { /* 临时文件清理失败不影响结果 */ }
-const failed = results.filter((r) => !r.pass);
-for (const r of results) console.log((r.pass ? 'PASS' : 'FAIL') + '  ' + r.name + (r.detail ? '  [' + r.detail + ']' : ''));
-console.log('\n' + (results.length - failed.length) + '/' + results.length + ' passed');
-process.exit(failed.length === 0 ? 0 : 1);
+test('B08: FIFO advances one turn at a time; Up removes only the latest queued message', async (t) => {
+  const { page, scope } = await openPage(t);
+  await send(page, 'A'); await waitStatus(page, 'accepted');
+  await send(page, 'B'); await waitStatus(page, 'queued', 1);
+  await send(page, 'C'); await waitStatus(page, 'queued', 2);
+  await editorOf(page).press('ArrowUp');
+  await page.waitForFunction(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.text === 'C');
+  assert.equal((await rowsOf(page))[2].status, 'cancelled');
+  await editorOf(page).press('Enter'); await waitStatus(page, 'queued', 3);
+  await page.getByTestId('end-turn').click(); await waitStatus(page, 'accepted', 1);
+  assert.deepEqual((await messages(page, scope)).map((message) => message.snapshot.text), ['A', 'B']);
+  await page.getByTestId('end-turn').click(); await waitStatus(page, 'accepted', 3);
+  assert.deepEqual((await messages(page, scope)).map((message) => message.snapshot.text), ['A', 'B', 'C']);
+});
+
+test('B09: steer reaches the existing turn and none leaves input unchanged', async (t) => {
+  const { page, scope } = await openPage(t);
+  await send(page, 'A'); await waitStatus(page, 'accepted');
+  await page.getByTestId('busy-mode').selectOption('steer');
+  await send(page, 'S'); await waitStatus(page, 'accepted', 1);
+  const records = await messages(page, scope);
+  assert.equal(records[1].delivery, 'steer');
+  assert.equal(records[1].turnId, `turn-${records[0].id}`);
+  await page.getByTestId('busy-mode').selectOption('none');
+  await send(page, 'keep');
+  assert.equal(await textOf(page), 'keep');
+  assert.equal((await messages(page, scope)).length, 2);
+});
+
+test('B10: injected IndexedDB boundary failure keeps A and sends no request', async (t) => {
+  const { page, scope } = await openPage(t);
+  await type(page, 'A');
+  await page.evaluate(() => window.composerTest.failWrite());
+  await page.getByTestId('send').click();
+  await page.getByTestId('storage-error').waitFor();
+  assert.equal(await textOf(page), 'A');
+  assert.equal((await messages(page, scope)).length, 0);
+  assert.equal((await rowsOf(page)).length, 0);
+  await page.getByTestId('send').click(); await waitStatus(page, 'accepted');
+  assert.equal((await messages(page, scope)).length, 1);
+});
+
+test('B11: local transaction gate is read-only only until payload ownership commits', async (t) => {
+  const { page, scope } = await openPage(t);
+  await type(page, 'A');
+  await page.evaluate(() => window.composerTest.holdWrite());
+  await editorOf(page).press('Enter');
+  await page.waitForFunction(() => window.composerTest.writeGateHit);
+  assert.equal(await editorOf(page).getAttribute('readonly'), '');
+  assert.equal((await messages(page, scope)).length, 0);
+  await editorOf(page).press('Enter');
+  await page.evaluate(() => window.composerTest.releaseWrite()); await waitStatus(page, 'accepted');
+  assert.equal((await messages(page, scope)).length, 1);
+  assert.equal(await textOf(page), '');
+});
+
+test('B12: Shift+Enter is a real newline; composition confirmation and held-key repeat do not submit', async (t) => {
+  const { page, scope } = await openPage(t);
+  await type(page, 'L1');
+  await editorOf(page).press('Shift+Enter'); await page.keyboard.type('L2');
+  await page.waitForFunction(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.text === 'L1\nL2');
+  await editorOf(page).dispatchEvent('keydown', { key: 'Enter', code: 'Enter', isComposing: true });
+  assert.equal((await rowsOf(page)).length, 0);
+  await page.getByTestId('scenario').selectOption('hold');
+  await page.keyboard.down('Enter'); await page.keyboard.down('Enter'); await page.keyboard.up('Enter');
+  await held(page); await page.getByTestId('release').click(); await waitStatus(page, 'accepted');
+  assert.equal((await messages(page, scope)).length, 1);
+});
+
+test('B13: stale tabs cannot overwrite each other in actual IndexedDB', async (t) => {
+  const first = await openPage(t);
+  const second = await openPage(t, { context: first.context, scope: first.scope });
+  await type(first.page, 'A');
+  await editorOf(second.page).fill('B');
+  await second.page.getByTestId('storage-error').waitFor();
+  assert.equal(await textOf(second.page), 'B');
+  assert.equal(await first.page.evaluate(async () => (await window.composerTest.store.read(window.composerTest.engine.getSnapshot().state.scopeId)).draft.snapshot.text), 'A');
+});
+
+test('B14: StrictMode retry uses the same ID and does not dispatch from a React updater', async (t) => {
+  const { page, scope } = await openPage(t);
+  await send(page, 'A', 'reject'); await waitStatus(page, 'rejected');
+  const id = (await rowsOf(page))[0].id;
+  await page.getByTestId('scenario').selectOption('normal');
+  await page.getByRole('button', { name: '原样重试' }).click(); await waitStatus(page, 'accepted');
+  assert.equal((await rowsOf(page)).length, 1);
+  assert.equal((await messages(page, scope))[0].id, id);
+});
+
+test('B15: ordinary Lexical edits preserve references owned by external integrations', async (t) => {
+  const { page } = await openPage(t, { editor: 'rich' });
+  await page.evaluate(async () => {
+    const engine = window.composerTest.engine;
+    const snapshot = structuredClone(engine.getSnapshot().state.draft.snapshot);
+    snapshot.references.push({ id: 'external-comment', kind: 'code-comment', value: { path: 'a.ts', line: 2 } });
+    await engine.edit(snapshot);
+  });
+  await editorOf(page).click(); await page.keyboard.type('A');
+  await page.waitForFunction(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.text === 'A');
+  assert.equal(await page.evaluate(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.references.some((item) => item.id === 'external-comment')), true);
+});
+
+test('B16: undo cannot resurrect a submitted Lexical message into its successor draft', async (t) => {
+  const { page } = await openPage(t, { editor: 'rich' });
+  await page.getByTestId('scenario').selectOption('hold');
+  await editorOf(page).click(); await page.keyboard.type('A');
+  await page.waitForFunction(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.text === 'A' && !window.composerTest.engine.getSnapshot().dirty);
+  await editorOf(page).press('Enter'); await held(page);
+  assert.equal(await textOf(page), '');
+  await editorOf(page).press(process.platform === 'darwin' ? 'Meta+z' : 'Control+z');
+  await page.evaluate(() => new Promise(requestAnimationFrame));
+  assert.equal(await textOf(page), '');
+  await page.getByTestId('release').click(); await waitStatus(page, 'accepted');
+});
+
+test('B17: failed receipt persistence retries only the local write and preserves B', async (t) => {
+  const { page, scope } = await openPage(t);
+  await send(page, 'A', 'hold'); await held(page);
+  await type(page, 'B');
+  await page.evaluate(() => window.composerTest.failWrite());
+  await page.getByTestId('release').click();
+  await page.waitForFunction(() => window.composerTest.engine.getSnapshot().pendingReceipts === 1 && Boolean(window.composerTest.engine.getSnapshot().error));
+  assert.equal(await textOf(page), 'B');
+  await page.getByRole('button', { name: '重试本地保存' }).click(); await waitStatus(page, 'accepted');
+  assert.equal(await textOf(page), 'B');
+  assert.equal((await messages(page, scope)).length, 1);
+});
+
+test('B18: an actual renderer crash retains the uncertain message and the durable successor draft', async (t) => {
+  const { page, context, scope } = await openPage(t);
+  await send(page, 'A', 'hold'); await held(page); await type(page, 'B');
+  const session = await context.newCDPSession(page);
+  let timer;
+  const crashed = new Promise((resolve) => page.once('crash', () => resolve(true)));
+  void session.send('Page.crash').catch(() => {});
+  const observed = await Promise.race([crashed, new Promise((resolve) => { timer = setTimeout(() => resolve(false), 3000); })]);
+  clearTimeout(timer);
+  assert.equal(observed, true, 'The crash injection must actually hit the renderer');
+  await page.close();
+  const { page: restored } = await openPage(t, { context, scope });
+  await waitStatus(restored, 'unknown');
+  assert.equal(await textOf(restored), 'B');
+  await restored.getByRole('button', { name: '核对送达状态' }).click(); await waitStatus(restored, 'accepted');
+  assert.equal((await messages(restored, scope)).length, 1);
+});
+
+test('B19: the executable host deduplicates admitted IDs and refuses a changed payload under the same ID', async (t) => {
+  const { page, scope } = await openPage(t);
+  await send(page, 'A'); await waitStatus(page, 'accepted');
+  const [stored] = await messages(page, scope);
+  const results = await page.evaluate(async (stored) => {
+    const { hash, ...payload } = stored;
+    const post = async (body) => (await fetch('api/send', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': body.id }, body: JSON.stringify(body),
+    })).json();
+    const duplicate = await post(payload);
+    const conflicting = await post({ ...payload, snapshot: { ...payload.snapshot, text: 'different content' } });
+    return { duplicate, conflicting };
+  }, stored);
+  assert.equal(results.duplicate.status, 'accepted');
+  assert.equal(results.conflicting.status, 'unknown');
+  assert.equal((await messages(page, scope)).length, 1);
+});

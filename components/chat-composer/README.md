@@ -1,83 +1,153 @@
-# chat-composer —— 聊天输入框该怎么写
+# Chat composer
 
-来源：ZCode 桌面端 v3.17.2 的「快速双击回车 → 消息已发出但输入框残留原文+换行」bug（[zai-org/feedback#1415](https://github.com/zai-org/feedback/issues/1415)）。修复过程中把"一个聊天输入框必须写对的几条规则"沉淀成了这套自包含参考实现：`useComposerSubmission.ts` 是提交状态机，`ChatComposer.tsx` 是展示壳，`demo.html` 是可以打开就玩的五模式对比页。
+一套新的 React 聊天输入组件：独立提交记录、事务持久化、完整编辑快照、稳定消息 ID，以及明确的送达状态。没有旧 hook API 兼容层，也没有用手写 React shim 验证业务行为。
 
-## 先记住唯一的时序图
+它源自 ZCode 3.17.2 双回车残留问题的调查；本目录现在是可执行的新实现，不是各家 Agent 的行为复刻或性能对比。
 
+## 行为契约
+
+1. **可靠交接后才清空。** 正文、编辑器结构、附件 Blob 和外部引用，与后继空草稿一起写入同一事务。保存失败不清空、不发送。
+2. **新草稿独立。** 每份草稿有 generation/revision；接纳、拒绝、迟到回执都不再清理或恢复当前编辑器。
+3. **失败单独保留。** 明确拒绝可原样重试或主动取回编辑。已有正文、空白、附件或引用时不能被取回操作覆盖。
+4. **送达不明不重发。** 超时、断连和未知异常进入 `unknown`；没有重试/恢复按钮。查询只核对原来的 ID。
+5. **一条消息一个稳定 ID。** 原样重试保持 ID 和快照；取回编辑后重新提交是新消息。服务端必须按 `(scopeId, id)` 去重并提供权威回执。
+6. **提交与模型运行分开。** 本地交接时短暂只读，网络等待时可写新草稿。模型运行时可选择 queue / steer / none。
+7. **引用有归属。** Lexical 只维护 mention 引用，不得删除外部集成提供的引用；Undo 历史不能跨过草稿交接或会话边界。
+
+```text
+当前草稿 A
+   │ 完整快照 + 新草稿，在同一个本地事务提交
+   ├──────────────► 后继草稿 B（立即可编辑）
+   ▼
+queued ── 保存 sending 标记 ──► sending ──► accepted
+                                │          rejected → 显式重试 / 取回编辑
+                                └────────► unknown  → 查询原 ID
 ```
-按下 Enter ──► 受理（同步：冻结快照 + 清空编辑器 + 上锁）
-                │
-                ├─ 异步：发送 RPC ──► 成功/失败
-                │                       │
-                ▼                       ▼
-        「在途窗口」结束 ◄──────────── 结算
-```
 
-**在途窗口 = 受理到结算之间**，短则几十毫秒（本地 IPC），长则数秒（远程模型/弱网）。所有 bug、所有模式差异都在这个窗口里。
-
-## 五条规则（每条都对应一个真实踩过的坑）
-
-| # | 规则 | 不这样会怎样 |
-|---|---|---|
-| ① | 「是否在途」「编辑器当前内容」用 **ref** 读，不用 state | 事件处理器读到的是旧值：快速双击的第二下看到"不在途"，防重复提交直接失效 |
-| ② | **受理即清空**：冻结快照、清空编辑器、上锁，三者必须在**同一同步块**、第一个 `await` 之前完成 | 清空拖到发送结算之后，在途窗口里编辑器还是"刚发出的正文"——第二次 Enter 就会作用于它 |
-| ③ | 提交在途时，Enter（裸键和 Ctrl/⌘+）**一律消费成 no-op**，绝不放行 | 放行 = 编辑器插换行；换行又会让"结算时清空"的门禁失效 → **已发正文 + 换行永久残留**，并被当草稿落盘 |
-| ④ | 失败恢复：只有编辑器**仍是空**才把快照搬回去；用户已写新内容就绝不覆盖，失败项单独保留 | 失败时无脑 setText 会吃掉用户刚写的新草稿 |
-| ⑤ | IME 组合中（`isComposing`）不拦截 Enter；Shift+Enter 放行为换行 | 中文用户回车确认候选时误发消息 |
-
-ZCode 3.17.2 的 bug 就是①③②三条叠加：提交在途 → Enter 被放行 → 插换行 → 换行推进内容版本 → 结算门禁（"期间无编辑才清空"）跳过清空 → **消息已发出，正文却留在了输入框**，还会被持久化成草稿。
-
-## 四家实现对比（同一个窗口，四种处理）
-
-| 场景 | ZCode 3.17.2 | ZCode 修复版 | DSH | Codex | Claude Code |
-|---|---|---|---|---|---|
-| 在途时草稿在哪 | 留在编辑器 | 已清空（进快照） | 留在编辑器 | 已清空 | 已清空 |
-| 在途时编辑器可编辑吗 | ✅ 可编辑 | ✅ 可编辑 | ❌ 只读锁定 | ✅ 但已空 | ✅ 但已空 |
-| 在途按 Enter | 插换行 → 残留 | no-op | no-op（物理锁） | 空 Enter no-op | 空 Enter no-op |
-| 空闲时何时清空 | 结算后 | 受理时 | Host 受理时 | 受理时 | 受理时 |
-| 模型生成中按 Enter | 排队 queue | 排队 queue | 排队 queue | steer | 排队 queue |
-
-要点：**"不残留"的关键不是把 Enter 吞掉，而是受理时就把正文搬出编辑器**——编辑器空了，第二次 Enter 自然是无害的空 Enter。吞 Enter 只是双保险。Codex/DSH/Claude Code 三家都这么做；ZCode 3.17.2 是唯一"不清空 + 可编辑 + Enter 转换行"三条件全占的。
+浏览器进程重启后，遗留的 `sending` 会变为 `unknown`，不会自动重发；恢复出的队列暂停，宿主确认当前轮次后显式继续投递。
 
 ## 文件
 
-| 文件 | 内容 |
-|---|---|
-| [`useComposerSubmission.ts`](./useComposerSubmission.ts) | 提交状态机 hook：Enter 语义、在途锁、受理即清空、失败恢复。零依赖。 |
-| [`ChatComposer.tsx`](./ChatComposer.tsx) | 展示壳：textarea + 失败项提示 + 发送按钮。React 19，无其他依赖。 |
-| [`demo.html`](./demo.html) | 双击打开就能玩的对比页：五种实现（ZCode 修复版 / ZCode 原版 / Codex / Claude Code / DSH）+ 可调时序 + 事件日志。35 项自动化断言全部通过。 |
-| [`verify/demo-playwright.mjs`](./verify/demo-playwright.mjs) | demo 断言的可复现脚本：`node demo-playwright.mjs`（需 playwright-core；浏览器通道默认 msedge，`CE_BROWSER_CHANNEL` 可覆盖）。 |
+| 文件 | 职责 |
+| --- | --- |
+| `core.ts` | 框架无关的生产状态机：交接、派发、接纳、重试、查询、队列、轮次、关闭 |
+| `types.ts` | 快照、提交记录、回执、宿主传输、存储与编辑器接口 |
+| `store.ts` | 原生 IndexedDB 事务与 revision CAS；另有明确用于测试/临时宿主的内存实现 |
+| `snapshots.ts` | 完整快照复制、只读视图与数据校验 |
+| `editor-adapter.ts` | 异步编辑器适配：按 generation/revision 校验应用结果 |
+| `useComposerSubmission.ts` | `useSyncExternalStore` 订阅，不在渲染或 state updater 里执行发送 |
+| `ChatComposer.tsx` | 纯文本输入、附件、提交记录、失败/未知恢复入口 |
+| `LexicalEditor.tsx` | 真实 Lexical 编辑器、mention token、JSON 恢复和历史隔离 |
+| `http-transport.ts` | 示例 HTTP 绑定：完整快照、幂等键、回执查询 |
+| `demo.tsx` / `demo.html` | 使用上述生产实现的交互演示，不另写一套状态机 |
+| `verify/` | 核心故障测试、真实浏览器测试、临时副本变异验证与演示服务 |
 
-## 用法
+## 使用
+
+Node >= 24，React 19。核心与 IndexedDB 存储不依赖 React；Lexical 编辑器使用 `lexical` / `@lexical/react`。
 
 ```tsx
-import { ChatComposer } from "./components/chat-composer/ChatComposer.js";
+import { createRoot } from "react-dom/client";
+import {
+  createComposer, IndexedDbComposerStore, ChatComposer, LexicalEditor,
+} from "./components/chat-composer/index.ts";
 
-<ChatComposer
-  placeholder="给 Agent 派活…"
-  onSubmit={async (text) => {
-    await agent.send(text);   // 抛错 = 发送失败，正文会自动回到编辑器
-  }}
-/>
+const store = await IndexedDbComposerStore.open("my-app-composer");
+const engine = await createComposer({
+  scopeId: "workspace-id/conversation-id",
+  store,
+  transport, // 必填，实现 send() 与 lookup()，见下面的协议
+  busyMode: "queue",
+  sendTimeoutMs: 15_000,
+});
+
+createRoot(document.getElementById("root")!).render(
+  <ChatComposer engine={engine} Editor={LexicalEditor} />,
+);
+
+// 宿主的真实模型事件，不由发送 Promise 的结束推断。
+await engine.beginTurn("turn-id");
+await engine.endTurn("turn-id");
+
+// 销毁宿主时取消请求；已写入的消息仍由存储持有。
+await engine.close();
+store.close();
 ```
 
-需要 mention / 斜杠命令 / 富文本时，把 textarea 换成 Lexical（ZCode 的做法）——键盘语义和提交状态机不需要任何改动，这也是把它们抽成独立 hook 的原因。
+去掉 `Editor` 属性使用纯文本编辑器。不要在每次 React render 中创建 engine；切会话应由宿主创建/关闭对应实例。不要将两个会话共用同一个 scopeId。
 
-## 验证记录
+## 传输协议
 
-- `demo.html`：35 项 Playwright 断言（五种模式 × 双击/在途锁/排队/失败恢复/↑ 取回/Shift+Enter），真实 Edge headless 全部通过——复现：`cd verify && node demo-playwright.mjs`
-- 真实 ZCode 应用（fork [`full-handoff` 分支](https://github.com/takomitkm/ZCode/tree/full-handoff)，[`250e6ed8`](https://github.com/takomitkm/ZCode/commit/250e6ed8)，diff 见 [compare](https://github.com/takomitkm/ZCode/compare/a9fe401...250e6ed8)）：新增用例 2 passing；官方结算套件 CST01–05 5 passing 无回归；两次变异校准分别命中"清空契约"与"Enter 契约"
+`send(request, { signal })` 与 `lookup({ id, scopeId }, { signal })` 返回以下一种结果：
 
-## turn 生命周期、队列与草稿持久化（已实现）
+```ts
+{ status: "accepted", receipt: { id, scopeId, turnId } }
+{ status: "rejected", reason: "可以证明没有接纳的原因" }
+{ status: "unknown", reason: "无法确认" }
+```
 
-- **turn 生命周期**：宿主调 `beginTurn()`（模型开始生成）/ `endTurn()`（本轮结束）驱动。`endTurn` 时队列非空则自动逐条发出。
-- **生成中按 Enter**：由 `busyEnter` 选项路由——`"queue"`（默认，ZCode/Claude Code 语义：入队、清空编辑器）、`"steer"`（Codex 语义：直接发送并入当前轮）、`"none"`（保留草稿不投递）。
-- **↑ 取回**：`popQueueToEditor()`——编辑器为空且队列非空时取回最近排队的一条；编辑器非空时绝不覆盖。
-- **草稿持久化**：传 `draftKey`（可选 `draftDebounceMs`，默认 350 ms）后草稿防抖落盘、挂载时恢复。**受理会同步清空草稿（不等防抖）**——这是 ZCode bug 的另一半：残留被当草稿落盘后，刷新页面会把已发出的正文复活进输入框。
-- 验证：`verify/turn-and-draft.test.mts` 27 项断言（排队多条、steer、none、↑ 取回、防抖落盘、重挂载恢复、受理同步清空、失败路径），Deno 全部通过。
+- `accepted` 是对端可靠接纳，不是模型回复完成。回执的消息、会话、轮次身份会校验。
+- 只有能证明未接纳时才能返回 `rejected`。HTTP 错误、超时、查询不到记录都不能直接等同于未发送。
+- 异常默认按 `unknown` 处理。超时取消本地等待不等于撤回服务端执行。
+- `request.snapshot` 含原始附件 Blob；传输层可上传并映射成宿主引用，但必须遵守同一消息 ID 的幂等契约。编辑器清空不意味着删除附件。
+- `steer` 请求包含当前 turnId；宿主必须校验该轮次是否仍可接纳插话。
+- 回执先到/后到、重复接纳、轮次先结束等顺序都不应修改新草稿。
+- 回执本地保存失败会留下待写回执，`engine.flush()` 只重试本地写入，不重新发送消息。发送标记写入失败时，显式重试本地保存会重新启动安全的待发队列。
 
-运行：`deno run --allow-read verify/turn-and-draft.test.mts`（或 `node verify/gen-hook.mjs && npx tsx verify/turn-and-draft.test.mts`）。
+前端本身不能实现服务端的“恰好执行一次”；宿主必须实现持久幂等与回执查询。示例服务演示这一协议，不连接模型 API。
 
-## 还没做
+## 完整快照与附件
 
-- **富文本**：mention / 斜杠命令建议直接上 Lexical（ZCode 的做法），`$getPromptMarkdown()` 取纯文本交给本 hook 即可——键盘语义与提交状态机不变。
+```ts
+{
+  text: "正文",
+  document: { format: "lexical", version: 1, value: editorStateJson },
+  attachments: [{ id, name, mediaType, data: blob }],
+  references: [{ id, kind: "code-comment", value: { path, line } }],
+}
+```
+
+正文为空但有附件/引用仍可提交。IndexedDB 保存实际 Blob 字节，不保存会在刷新后失效的 `blob:` 地址。队列、重试、取回编辑使用同一完整快照。
+
+提交记录保留本地副本，直到用户明确移除已接纳、已拒绝或已取回的记录；`unknown`、`sending`、`queued` 不允许直接遗忘。移除一条记录不删除其他草稿仍持有的附件。当前组件不创建附件预览 object URL，因此没有依赖外部 URL 生命周期的隐藏所有权。
+
+自定义编辑器使用 `createEditorAdapter(engine)`：`capture()` 取完整快照；`apply(snapshot, expectedDraft)` 只接受同一 generation/revision 的结果，避免异步附件准备或格式化覆盖后来的输入。
+
+## 键盘与队列
+
+- Enter、Ctrl/Cmd+Enter：发送；在当前请求等待接纳时消费为无操作。
+- 空 Enter、发送键 Repeat：不创建消息、不插换行。
+- Shift+Enter / Alt+Enter：明确换行。
+- IME 组合确认：交给输入法。
+- 空编辑器的 Up：取回最近一条尚未派发的排队消息；有空白、附件或引用时也不覆盖。
+- `queue`：完整快照入队；对应轮次结束后只派发下一条，等新轮次结束再推进。
+- `steer`：向当前轮次提交；`none`：保留草稿不投递。
+
+`endTurn(id)` 使用明确的轮次身份；迟到的结束事件不能结束另一轮，迟到的接纳也不能复活已经结束的轮次。
+
+## 本地运行与验证
+
+```sh
+cd components/chat-composer
+npm ci
+npm run typecheck
+npm test
+npm run test:browser
+npm run test:mutations
+npm run demo
+```
+
+浏览器测试使用已安装的浏览器：Windows 默认 Edge，可用 `CE_BROWSER_CHANNEL=chrome` 等指定；非 Windows 可提供 Playwright 已安装的 Chromium。测试只启动回环地址的隔离演示服务，并为各用例建立独立浏览器上下文，不连接真实账号/模型。
+
+演示地址默认 `http://127.0.0.1:5179/`，`PORT` 可覆盖。故障选择包括明确拒绝、接纳后丢回执和暂扣回执。
+
+- 核心测试调用生产核心，不重写提交逻辑。
+- 浏览器测试使用真实 React StrictMode、Lexical、IndexedDB、HTTP 幂等服务和实际渲染器崩溃注入。
+- 变异脚本只在系统临时副本中破坏关键行为，要求基线绿、破坏后红；源代码不被改写。
+- 具体结果、已排除范围和红绿证据见 `verify/RESULTS.md` 与 `verify/FAILURE-MODES.md`。
+
+## 存储与宿主边界
+
+存储适配器的 CAS 必须原子地处理草稿和提交记录，失败不得部分写入。默认 IndexedDB 实现请求 strict durability。revision 冲突时保留当前窗口的未保存输入并显示错误，不静默覆盖另一窗口。
+
+存储配额/读写失败会明确显示，用户可重试本地保存。IndexedDB 是本地持久化，不是远端备份；清除站点数据或丢失整个浏览器配置文件不在恢复保证内。没有旧版本数据迁移，未知或损坏 schema 会拒绝打开，不能覆盖原数据。

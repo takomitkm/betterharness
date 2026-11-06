@@ -1,0 +1,22 @@
+{
+  "name": "@betterharness/chat-composer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "test": "node --test verify/core.test.ts verify/recovery.test.ts verify/adapter.test.ts verify/durability.test.ts",
+    "typecheck": "tsc --noEmit",
+    "build:demo": "node verify/build-demo.mjs",
+    "demo": "node verify/demo-server.mjs",
+    "test:browser": "node --test verify/demo-playwright.mjs",
+    "test:mutations": "node verify/mutations.mjs"
+  },
+  "peerDependencies": { "react": "^19.2.0", "react-dom": "^19.2.0" },
+  "dependencies": { "lexical": "^0.36.0", "@lexical/react": "^0.36.0" },
+  "devDependencies": {
+    "@types/node": "^24.0.0", "@types/react": "^19.2.0", "@types/react-dom": "^19.2.0",
+    "esbuild": "^0.25.0", "playwright-core": "^1.59.1", "typescript": "^5.9.0",
+    "react": "^19.2.0", "react-dom": "^19.2.0"
+  }
+}
