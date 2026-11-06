@@ -1,0 +1,415 @@
+<div id="ce-lab">
+  <div class="viz-row" role="group" aria-label="实现版本">
+    <button class="btn" type="button" data-mode="zcode-fix" aria-pressed="true">ZCode 修复版</button>
+    <button class="btn" type="button" data-mode="zcode-3172" aria-pressed="false">ZCode 3.17.2 原版</button>
+    <button class="btn" type="button" data-mode="codex" aria-pressed="false">Codex</button>
+    <button class="btn" type="button" data-mode="cc" aria-pressed="false">Claude Code</button>
+    <button class="btn" type="button" data-mode="dsh" aria-pressed="false">DSH</button>
+  </div>
+
+  <div class="viz-controls">
+    <label class="form-label" for="ce-accept">提交在途窗口 <span class="tabular-nums" id="ce-accept-val">600</span> ms</label>
+    <input type="range" class="form-range" id="ce-accept" min="150" max="2000" step="50" value="600">
+    <label class="form-label" for="ce-gen">模型生成 <span class="tabular-nums" id="ce-gen-val">2200</span> ms</label>
+    <input type="range" class="form-range" id="ce-gen" min="600" max="6000" step="100" value="2200">
+  </div>
+
+  <div class="viz-controls">
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" id="ce-fail">
+      <span class="form-check-label">下一次发送失败</span>
+    </label>
+    <button class="btn btn-sm" type="button" id="ce-dbl">快速双击 Enter（80 ms）</button>
+    <button class="btn btn-ghost btn-sm" type="button" id="ce-reset">重置</button>
+  </div>
+
+  <label class="form-label" for="ce-editor">输入框（Enter 发送 / Shift+Enter 换行 / ↑ 取回队列）</label>
+  <textarea class="form-control" id="ce-editor" rows="3" spellcheck="false"></textarea>
+
+  <div class="viz-row">
+    <button class="btn btn-primary" type="button" id="ce-send">发送</button>
+    <span class="text-small text-muted" id="ce-phase">空闲</span>
+  </div>
+
+  <table class="table table-sm">
+    <tbody>
+      <tr><th>编辑器内容</th><td><code id="ce-text">""</code></td></tr>
+      <tr><th>已发 / 失败 / 队列</th><td id="ce-counts" class="tabular-nums">0 / 0 / 0</td></tr>
+    </tbody>
+  </table>
+
+  <ol id="ce-log" aria-live="polite" class="text-small"></ol>
+</div>
+
+<style>
+  #ce-lab { display: flex; flex-direction: column; gap: 8px; }
+  #ce-lab .form-range { flex: 1 1 150px; min-width: 110px; }
+  #ce-lab #ce-editor { min-height: 72px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #ce-lab #ce-log { margin: 0; padding-left: 1.4em; max-height: 210px; overflow-y: auto; }
+  #ce-lab #ce-log li { margin: 2px 0; line-height: 1.45; }
+  #ce-lab #ce-log time { color: var(--muted-foreground); font-variant-numeric: tabular-nums; margin-right: 6px; }
+  #ce-lab #ce-log .ok { color: var(--green); }
+  #ce-lab #ce-log .bad { color: var(--red); }
+  #ce-lab #ce-log .warn { color: var(--orange); }
+  #ce-lab #ce-log .dim { color: var(--muted-foreground); }
+  #ce-lab #ce-phase.win { color: var(--orange); }
+  #ce-lab #ce-phase.busy { color: var(--blue); }
+</style>
+
+<script>
+(function () {
+  var root = document.getElementById('ce-lab');
+  var ta = document.getElementById('ce-editor');
+  var logEl = document.getElementById('ce-log');
+  var textEl = document.getElementById('ce-text');
+  var countsEl = document.getElementById('ce-counts');
+  var phaseEl = document.getElementById('ce-phase');
+  var acceptEl = document.getElementById('ce-accept');
+  var acceptValEl = document.getElementById('ce-accept-val');
+  var genEl = document.getElementById('ce-gen');
+  var genValEl = document.getElementById('ce-gen-val');
+  var failEl = document.getElementById('ce-fail');
+  var dblBtn = document.getElementById('ce-dbl');
+  var resetBtn = document.getElementById('ce-reset');
+  var sendBtn = document.getElementById('ce-send');
+  var modeBtns = root.querySelectorAll('[data-mode]');
+
+  var LABELS = {
+    'zcode-fix': 'ZCode 修复版',
+    'zcode-3172': 'ZCode 3.17.2 原版',
+    'codex': 'Codex',
+    'cc': 'Claude Code',
+    'dsh': 'DSH'
+  };
+
+  var S = blank();
+  var timers = [];
+
+  function blank() {
+    return {
+      mode: 'zcode-fix',
+      text: '',
+      phase: 'idle',
+      revisionChanged: false,
+      sent: [],
+      failed: [],
+      queue: [],
+      seq: 0,
+      logs: [],
+      acceptMs: 600,
+      genMs: 2200,
+      failNext: false,
+      locked: false,
+      t0: (typeof performance !== 'undefined' ? performance.now() : Date.now())
+    };
+  }
+
+  function now() {
+    var p = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    return ((p - S.t0) / 1000).toFixed(2) + 's';
+  }
+
+  function log(msg, kind) {
+    if (S.logs.length > 70) S.logs.shift();
+    S.logs.push({ at: now(), msg: msg, kind: kind || 'dim' });
+    renderLog();
+  }
+
+  function renderLog() {
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < S.logs.length; i++) {
+      var item = S.logs[i];
+      var li = document.createElement('li');
+      li.className = item.kind;
+      var t = document.createElement('time');
+      t.textContent = item.at;
+      li.appendChild(t);
+      li.appendChild(document.createTextNode(item.msg));
+      frag.appendChild(li);
+    }
+    logEl.textContent = '';
+    logEl.appendChild(frag);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function renderState() {
+    textEl.textContent = JSON.stringify(S.text);
+    countsEl.textContent = S.sent.length + ' / ' + S.failed.length + ' / ' + S.queue.length;
+    ta.readOnly = !!S.locked;
+    if (S.phase === 'inflight') {
+      phaseEl.textContent = S.locked
+        ? '提交在途（编辑器已锁定只读 —— 物理上打不进字）'
+        : '提交在途（' + S.acceptMs + ' ms 窗口 —— 三家差异只在这里）';
+      phaseEl.className = 'text-small win';
+    } else if (S.phase === 'generating') {
+      phaseEl.textContent = '模型生成中（忙碌：Enter = 排队 / 插话）';
+      phaseEl.className = 'text-small busy';
+    } else {
+      phaseEl.textContent = '空闲';
+      phaseEl.className = 'text-small text-muted';
+    }
+  }
+
+  function setText(v) {
+    S.text = v;
+    ta.value = v;
+    renderState();
+  }
+
+  function insertNewline() {
+    var start = typeof ta.selectionStart === 'number' ? ta.selectionStart : S.text.length;
+    var end = typeof ta.selectionEnd === 'number' ? ta.selectionEnd : S.text.length;
+    var next = S.text.slice(0, start) + '\n' + S.text.slice(end);
+    S.text = next;
+    ta.value = next;
+    var caret = start + 1;
+    try { ta.selectionStart = ta.selectionEnd = caret; } catch (e) { /* ignore */ }
+    renderState();
+  }
+
+  function nextId() {
+    S.seq += 1;
+    return 'msg-' + S.seq;
+  }
+
+  function clearTimers() {
+    for (var i = 0; i < timers.length; i++) clearTimeout(timers[i]);
+    timers = [];
+  }
+
+  function schedule(fn, ms) {
+    var id = setTimeout(fn, ms);
+    timers.push(id);
+    return id;
+  }
+
+  function startSubmit(text) {
+    var id = nextId();
+    var willFail = !!S.failNext;
+    if (willFail) {
+      S.failNext = false;
+      failEl.checked = false;
+    }
+
+    S.phase = 'inflight';
+    S.revisionChanged = false;
+
+    if (S.mode === 'zcode-3172') {
+      log('受理 ' + id + ' → 编辑器【仍保留正文】，等结算时才清', 'warn');
+    } else if (S.mode === 'dsh') {
+      S.locked = true;
+      log('受理 ' + id + ' → 编辑器锁定只读（contenteditable=false），草稿留在原地等 Host 受理', 'warn');
+    } else {
+      setText('');
+      log('受理 ' + id + ' → 立即清空（正文进冻结快照），发送转后台', 'ok');
+    }
+    renderState();
+
+    if (S.mode === 'dsh') {
+      schedule(function () {
+        if (S.phase !== 'inflight') return;
+        S.locked = false;
+        if (willFail) {
+          S.failed.push({ id: id, text: text });
+          log('Host 拒绝 → 保留草稿并解锁（rollback to claimed）', 'bad');
+          S.phase = 'idle';
+          renderState();
+          return;
+        }
+        setText('');
+        log('Host 受理 → commit-draft 清空 + 解锁，随后进入生成', 'ok');
+        S.phase = 'generating';
+        renderState();
+        schedule(function () {
+          S.sent.push({ id: id, text: text });
+          log('生成完成 ' + id + '：「' + text + '」', 'ok');
+          S.phase = 'idle';
+          renderState();
+          drainQueue();
+        }, S.genMs);
+      }, S.acceptMs);
+      return;
+    }
+
+    schedule(function () {
+      if (S.phase !== 'inflight') return;
+      S.phase = 'generating';
+      renderState();
+      log('在途窗口结束 → 进入模型生成；此后 Enter 恢复正常语义（排队/插话）', 'dim');
+    }, S.acceptMs);
+
+    schedule(function () {
+      if (willFail) {
+        S.failed.push({ id: id, text: text });
+        log('发送失败 ' + id + '：「' + text + '」', 'bad');
+      } else {
+        S.sent.push({ id: id, text: text });
+        log('发送成功 ' + id + '：「' + text + '」', 'ok');
+      }
+      S.phase = 'idle';
+      settle(id, text, !willFail);
+      renderState();
+      if (!willFail) drainQueue();
+    }, S.acceptMs + S.genMs);
+  }
+
+  function settle(id, text, ok) {
+    if (S.mode !== 'zcode-3172') {
+      if (!ok) {
+        if (S.text.trim() === '') {
+          setText(text);
+          log('失败恢复 → 正文搬回空编辑器，可直接重发', 'warn');
+        } else {
+          log('失败恢复 → 你已在写新内容，' + id + ' 留在失败项（不覆盖新输入）', 'warn');
+        }
+      }
+      return;
+    }
+    if (!ok) {
+      log('失败 → 正文留在编辑器', 'dim');
+      return;
+    }
+    if (!S.revisionChanged) {
+      setText('');
+      log('结算 ' + id + ' → 期间无编辑，清空编辑器', 'ok');
+    } else {
+      log('结算 ' + id + ' → 期间有编辑，revision 变了 → 跳过清空：正文+换行残留 ← BUG', 'bad');
+    }
+  }
+
+  function drainQueue() {
+    if (S.queue.length === 0) return;
+    var next = S.queue.shift();
+    log('本轮结束 → 自动发出队列里的「' + next + '」（' + (S.phase === 'idle' ? '空闲' : S.phase) + '）', 'dim');
+    startSubmit(next);
+  }
+
+  function pressEnter(shift) {
+    var hasText = S.text.trim() !== '';
+    var m = S.mode;
+
+    if (shift) {
+      insertNewline();
+      if (S.phase === 'inflight') S.revisionChanged = true;
+      log('Shift+Enter → 显式换行（各模式都放行）', 'dim');
+      return;
+    }
+
+    if (S.phase === 'inflight') {
+      if (m === 'zcode-3172') {
+        insertNewline();
+        S.revisionChanged = true;
+        log('Enter →【在途】放行给编辑器 → 插换行，并顶掉结算清空 ← 原始 BUG', 'bad');
+      } else if (m === 'dsh') {
+        log('Enter →【在途】编辑器只读 + phase 锁 → no-op（物理上连换行都插不进去）', 'ok');
+      } else {
+        log('Enter →【在途】no-op（不发送、不换行；框里已写的新内容也原样保留）', 'ok');
+      }
+      return;
+    }
+
+    if (S.phase === 'generating') {
+      if (!hasText) { log('Enter →【生成中】空输入，不提交', 'dim'); return; }
+      S.queue.push(S.text);
+      setText('');
+      if (m === 'zcode-fix' || m === 'zcode-3172' || m === 'dsh') {
+        log('Enter →【生成中】按 inputRouting 排队（queue），本轮结束后发送', 'ok');
+      } else if (m === 'codex') {
+        log('Enter →【生成中】Codex 按 steer 并入当前轮（不新开一轮）', 'ok');
+      } else {
+        log('Enter →【生成中】入队 queuedCommands；↑ 可取回编辑', 'ok');
+      }
+      renderState();
+      return;
+    }
+
+    if (!hasText) { log('Enter → 空输入，不提交', 'dim'); return; }
+    startSubmit(S.text);
+  }
+
+  function doubleEnter() {
+    log('—— 快速双击 Enter（80 ms），落在在途窗口内 ——', 'dim');
+    pressEnter(false);
+    schedule(function () { pressEnter(false); }, 80);
+  }
+
+  function reset() {
+    clearTimers();
+    var mode = S.mode;
+    S = blank();
+    S.mode = mode;
+    S.acceptMs = parseInt(acceptEl.value, 10);
+    S.genMs = parseInt(genEl.value, 10);
+    S.failNext = failEl.checked;
+    setText('');
+    log('已重置（' + LABELS[mode] + '）', 'dim');
+    renderState();
+  }
+
+  ta.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.isComposing) {
+      e.preventDefault();
+      pressEnter(e.shiftKey);
+      return;
+    }
+    if (e.key === 'ArrowUp' && S.mode === 'cc' && S.queue.length > 0 && S.text.trim() === '') {
+      e.preventDefault();
+      var back = S.queue.pop();
+      setText(back);
+      renderState();
+      log('↑ 从队列取回：「' + back + '」', 'dim');
+    }
+  });
+
+  ta.addEventListener('input', function () {
+    S.text = ta.value;
+    if (S.phase === 'inflight') S.revisionChanged = true;
+    renderState();
+  });
+
+  acceptEl.addEventListener('input', function () {
+    S.acceptMs = parseInt(acceptEl.value, 10);
+    acceptValEl.textContent = String(S.acceptMs);
+    renderState();
+  });
+
+  genEl.addEventListener('input', function () {
+    S.genMs = parseInt(genEl.value, 10);
+    genValEl.textContent = String(S.genMs);
+  });
+
+  failEl.addEventListener('change', function () {
+    S.failNext = failEl.checked;
+    log(failEl.checked ? '下一次发送将失败' : '已取消强制失败', 'dim');
+  });
+
+  dblBtn.addEventListener('click', doubleEnter);
+  resetBtn.addEventListener('click', reset);
+  sendBtn.addEventListener('click', function () { pressEnter(false); });
+
+  for (var i = 0; i < modeBtns.length; i++) {
+    modeBtns[i].addEventListener('click', function (e) {
+      var btn = e.currentTarget;
+      var mode = btn.getAttribute('data-mode');
+      if (mode === S.mode) return;
+      clearTimers();
+      S = blank();
+      S.mode = mode;
+      S.acceptMs = parseInt(acceptEl.value, 10);
+      S.genMs = parseInt(genEl.value, 10);
+      S.failNext = failEl.checked;
+      for (var j = 0; j < modeBtns.length; j++) {
+        modeBtns[j].setAttribute('aria-pressed', modeBtns[j] === btn ? 'true' : 'false');
+      }
+      setText('');
+      log('切换到 ' + LABELS[mode], 'dim');
+      if (mode === 'zcode-3172') log('这一版：在途 Enter 会插换行 → 残留', 'bad');
+      renderState();
+    });
+  }
+
+  setText('');
+  renderState();
+  log('就绪。先「快速双击 Enter」看在途窗口；再输入第二句、在生成中按 Enter 看排队', 'dim');
+})();
+</script>
