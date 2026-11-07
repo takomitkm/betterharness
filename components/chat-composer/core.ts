@@ -148,6 +148,10 @@ export class ComposerEngine {
   submit(): Promise<Submission | null> {
     if (this.closed || this.admitting || this.view.sending || !hasContent(this.draft.snapshot)) return Promise.resolve(null);
     if (this.durable.activeTurn && this.mode === "none") return Promise.resolve(null);
+    // 有序文档（document.value）随快照整体捕获：这里不展开、不拍平、不重排。
+    // 附件引用完整性由 validateSnapshot 保证（文档附件节点必须有对应附件条目；反之 rail-only 合法）。
+    // 宿主序列化消息内容时的顺序约定：文档中附件节点按出现顺序参与正文，未被文档引用的附件
+    // 由宿主追加在文档内容之后（见 http-transport.ts 的示例绑定）。
     const captured = copy(this.draft);
     // The short read-only interval is local persistence, never the network or model turn.
     this.admitting = true;

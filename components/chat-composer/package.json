@@ -5,7 +5,7 @@
   "type": "module",
   "engines": { "node": ">=24" },
   "scripts": {
-    "test": "node --test verify/core.test.ts verify/recovery.test.ts verify/adapter.test.ts verify/durability.test.ts",
+    "test": "node --test verify/core.test.ts verify/recovery.test.ts verify/adapter.test.ts verify/durability.test.ts verify/foundation.test.ts",
     "typecheck": "tsc --noEmit",
     "build:demo": "node verify/build-demo.mjs",
     "demo": "node verify/demo-server.mjs",

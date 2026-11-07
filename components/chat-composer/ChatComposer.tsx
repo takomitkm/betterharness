@@ -1,9 +1,18 @@
-import type { ComponentType } from "react";
+import { useCallback, useRef, type ComponentType } from "react";
 import type { ComposerEngine } from "./core.ts";
-import { copy, hasContent, isEmptyDraft } from "./snapshots.ts";
+import { copy, documentWithoutAttachment, hasContent, isEmptyDraft, newAssetId } from "./snapshots.ts";
 import { useComposerSubmission } from "./useComposerSubmission.ts";
+import type { AssetId } from "./types.ts";
 
-export interface EditorProps { engine: ComposerEngine; placeholder?: string }
+export interface EditorProps {
+  engine: ComposerEngine;
+  placeholder?: string;
+  /**
+   * 富文本编辑器（Lexical）挂载后注册「在当前光标处插入附件节点」的入口，卸载时以 null 注销。
+   * 纯文本编辑器不注册：其文档只是纯文本，附件保持 rail-only，不进有序文档（见 ChatComposer）。
+   */
+  registerAttachmentInserter?: (insert: ((assetId: AssetId) => void) | null) => void;
+}
 
 export function TextareaEditor({ engine, placeholder }: EditorProps) {
   const view = useComposerSubmission(engine);
@@ -34,25 +43,47 @@ export function ChatComposer({ engine, Editor = TextareaEditor, placeholder = "�
 }) {
   const view = useComposerSubmission(engine);
   const snapshot = view.state.draft.snapshot;
+  const inserterRef = useRef<((assetId: AssetId) => void) | null>(null);
+  const registerAttachmentInserter = useCallback((insert: ((assetId: AssetId) => void) | null) => {
+    inserterRef.current = insert;
+  }, []);
   return <section className="chat-composer" aria-label="聊天输入框">
-    <Editor engine={engine} placeholder={placeholder} />
+    <Editor engine={engine} placeholder={placeholder} registerAttachmentInserter={registerAttachmentInserter} />
     <div className="attachments" aria-label="草稿附件">
       {snapshot.attachments.map((file) => <span key={file.id}>
         {file.name} ({file.data.size} B)
         <button type="button" disabled={view.admitting} aria-label={`移除 ${file.name}`} onClick={() => {
           const latest = engine.getSnapshot().state.draft.snapshot;
-          void engine.edit({ ...copy(latest), attachments: latest.attachments.filter((item) => item.id !== file.id) });
+          // 一次变更同时撤下附件条目与其在有序文档中的节点：文档附件节点的 AssetId 不允许悬空，
+          // 所以不能先删条目再等编辑器同步（validateSnapshot 会拒绝中间状态）。
+          void engine.edit({
+            ...copy(latest),
+            attachments: latest.attachments.filter((item) => item.id !== file.id),
+            document: latest.document
+              ? { ...latest.document, value: documentWithoutAttachment(latest.document.value, file.id) }
+              : undefined,
+          });
         }}>×</button>
       </span>)}
     </div>
     <div className="composer-actions">
       <label>添加附件 <input data-testid="files" type="file" multiple disabled={view.admitting} onChange={(event) => {
         const files = Array.from(event.target.files ?? []);
-        const current = engine.getSnapshot().state.draft.snapshot;
-        void engine.edit({ ...copy(current), attachments: [...current.attachments, ...files.map((file) => ({
-          id: crypto.randomUUID(), name: file.name, mediaType: file.type || "application/octet-stream", data: file,
-        }))] });
         event.target.value = "";
+        if (!files.length) return;
+        const current = engine.getSnapshot().state.draft.snapshot;
+        const entries = files.map((file) => ({
+          id: newAssetId(), name: file.name, mediaType: file.type || "application/octet-stream", data: file,
+        }));
+        // 附件条目先进快照；等它落盘后再把节点插到光标处（onChange 携带同一批 AssetId
+        // 更新有序文档）。不能并发：条目编辑的中间渲染会用旧文档重置编辑器，吞掉刚插入的节点。
+        // 不对称说明：纯文本模式没有插入入口（registerAttachmentInserter 未注册），
+        // 附件保持 rail-only，文档仍是纯文本。
+        void (async () => {
+          if (!(await engine.edit({ ...copy(current), attachments: [...current.attachments, ...entries] }))) return;
+          const insert = inserterRef.current;
+          if (insert) for (const entry of entries) insert(entry.id);
+        })();
       }} /></label>
       <button type="button" data-testid="send" disabled={view.admitting || view.sending || !hasContent(snapshot) || view.closed} onClick={() => void engine.submit()}>发送</button>
       <button type="button" data-testid="take-queue" disabled={view.admitting || !isEmptyDraft(snapshot) || !view.state.submissions.some((item) => item.status === "queued")} onClick={() => void engine.takeLatestQueued()}>取回最近排队消息</button>

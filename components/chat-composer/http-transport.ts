@@ -1,5 +1,10 @@
 import type { ComposerTransport, DeliveryResult, SendRequest } from "./types.ts";
 
+/**
+ * 宿主序列化约定：消息内容顺序 = document.value 中附件节点按出现顺序参与正文，
+ * 未被文档引用的附件（rail-only）追加在文档内容之后。这里不重排快照字段，
+ * 只把附件条目的 Blob 字节转成 base64（字节本身永不进入 document.value）。
+ */
 async function encode(request: SendRequest) {
   return {
     ...request,

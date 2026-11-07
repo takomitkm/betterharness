@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { LexicalComposer } from "@lexical/react/LexicalComposer";
 import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext";
 import { ContentEditable } from "@lexical/react/LexicalContentEditable";
@@ -7,16 +7,18 @@ import { HistoryPlugin } from "@lexical/react/LexicalHistoryPlugin";
 import { OnChangePlugin } from "@lexical/react/LexicalOnChangePlugin";
 import { LexicalErrorBoundary } from "@lexical/react/LexicalErrorBoundary";
 import {
-  $createParagraphNode, $createTextNode, $getRoot, $getSelection, $isRangeSelection,
-  TextNode, KEY_ENTER_COMMAND, KEY_ARROW_UP_COMMAND, COMMAND_PRIORITY_HIGH, CLEAR_HISTORY_COMMAND, HISTORIC_TAG,
-  type SerializedTextNode, type LexicalNode, type EditorState,
+  $createParagraphNode, $createTextNode, $getRoot, $getSelection, $isRangeSelection, $setSelection,
+  DecoratorNode, TextNode, KEY_ENTER_COMMAND, KEY_ARROW_UP_COMMAND, COMMAND_PRIORITY_HIGH, CLEAR_HISTORY_COMMAND, HISTORIC_TAG,
+  type SerializedTextNode, type SerializedLexicalNode, type LexicalNode, type RangeSelection, type LexicalEditor as LexicalEditorInstance, type EditorState,
 } from "lexical";
 import type { EditorProps } from "./ChatComposer.tsx";
-import type { JsonValue } from "./types.ts";
-import { copy, isEmptyDraft } from "./snapshots.ts";
+import type { AssetId, JsonValue, NodeId } from "./types.ts";
+import { copy, isEmptyDraft, newNodeId } from "./snapshots.ts";
 import { useComposerSubmission } from "./useComposerSubmission.ts";
 
 type SerializedMention = SerializedTextNode & { referenceId: string };
+/** 附件节点的序列化形态：只承载身份（NodeId + AssetId），字节与元数据都在附件条目上。 */
+type SerializedAttachment = SerializedLexicalNode & { type: "composer-attachment"; version: 1; nodeId: NodeId; assetId: AssetId };
 
 export class ComposerMentionNode extends TextNode {
   __referenceId: string;
@@ -39,10 +41,91 @@ export class ComposerMentionNode extends TextNode {
   isTextEntity(): boolean { return true; }
 }
 
-function Integration({ engine }: EditorProps) {
+/** 正文中的附件节点：文档只记录身份，随节点移动/重排/恢复保持不变。 */
+export class ComposerAttachmentNode extends DecoratorNode<null> {
+  __nodeId: NodeId;
+  __assetId: AssetId;
+  static getType(): string { return "composer-attachment"; }
+  static clone(node: ComposerAttachmentNode): ComposerAttachmentNode {
+    return new ComposerAttachmentNode(node.__assetId, node.__nodeId, node.__key);
+  }
+  constructor(assetId: AssetId, nodeId: NodeId, key?: string) {
+    super(key); this.__assetId = assetId; this.__nodeId = nodeId;
+  }
+  static importJSON(value: SerializedAttachment): ComposerAttachmentNode {
+    // 恢复时保留原 NodeId/AssetId：节点身份不因重排、交接或重启而改变。
+    return new ComposerAttachmentNode(value.assetId, value.nodeId).updateFromJSON(value);
+  }
+  exportJSON(): SerializedAttachment {
+    return { ...super.exportJSON(), type: "composer-attachment", version: 1, nodeId: this.__nodeId, assetId: this.__assetId };
+  }
+  createDOM(): HTMLElement {
+    const element = document.createElement("span");
+    element.className = "attachment";
+    element.setAttribute("data-node-id", this.__nodeId);
+    element.setAttribute("data-asset-id", this.__assetId);
+    return element;
+  }
+  updateDOM(): false { return false; }
+  // 基类默认即所需：isInline() 为 true（可与文字同行），decorate() 返回 null（芯片外观由
+  // createDOM 的元素 + CSS 承担，无需 React 门户）。
+}
+
+/** 把附件节点插到当前选区：一次 editor.update 完成，NodeId 在创建时固定并随节点走。 */
+export function insertAttachmentNode(
+  editor: LexicalEditorInstance,
+  assetId: AssetId,
+  lastSelection?: { current: RangeSelection | null },
+): void {
+  editor.update(() => {
+    const node = new ComposerAttachmentNode(assetId, newNodeId());
+    const selection = $getSelection();
+    if ($isRangeSelection(selection)) {
+      selection.insertNodes([node]);
+      return;
+    }
+    // 文件选择器等交互会把焦点移出编辑器，此时活动选区为空；
+    // 恢复最后记住的文本选区，让附件插回用户原来看的位置而不是段落末尾。
+    const remembered = lastSelection?.current ?? null;
+    if (remembered) {
+      try {
+        $setSelection(remembered.clone());
+        const restored = $getSelection();
+        if ($isRangeSelection(restored)) {
+          restored.insertNodes([node]);
+          return;
+        }
+      } catch {
+        // 记忆选区引用的节点可能已被删除；走末尾追加兜底。
+      }
+    }
+    const root = $getRoot();
+    let paragraph = root.getLastChild();
+    if (!paragraph) { paragraph = $createParagraphNode(); root.append(paragraph); }
+    (paragraph as LexicalNode & { append(...nodes: LexicalNode[]): unknown }).append(node);
+  });
+}
+
+function Integration({ engine, registerAttachmentInserter }: EditorProps) {
   const [editor] = useLexicalComposerContext();
   const view = useComposerSubmission(engine);
   const draft = view.state.draft;
+  // 文件选择器抢焦点后活动选区为空；记住最后的文本选区，附件节点仍插回原位置。
+  const lastSelectionRef = useRef<RangeSelection | null>(null);
+
+  useEffect(() => {
+    return editor.registerUpdateListener(({ editorState }) => {
+      editorState.read(() => {
+        const selection = $getSelection();
+        if ($isRangeSelection(selection)) lastSelectionRef.current = selection.clone();
+      });
+    });
+  }, [editor]);
+
+  useEffect(() => {
+    registerAttachmentInserter?.((assetId) => insertAttachmentNode(editor, assetId, lastSelectionRef));
+    return () => registerAttachmentInserter?.(null);
+  }, [editor, registerAttachmentInserter]);
 
   useLayoutEffect(() => {
     editor.setEditable(!view.admitting && !view.closed);
@@ -126,9 +209,9 @@ function Integration({ engine }: EditorProps) {
 }
 
 /** Actual Lexical serialization, token nodes and restoration; no string-only rich-text substitute. */
-export function LexicalEditor({ engine, placeholder }: EditorProps) {
+export function LexicalEditor({ engine, placeholder, registerAttachmentInserter }: EditorProps) {
   return <LexicalComposer initialConfig={{
-    namespace: "ReliableComposer", nodes: [ComposerMentionNode],
+    namespace: "ReliableComposer", nodes: [ComposerMentionNode, ComposerAttachmentNode],
     theme: { paragraph: "composer-paragraph" }, onError(error) { throw error; },
   }}>
     <div className="rich-editor">
@@ -139,6 +222,6 @@ export function LexicalEditor({ engine, placeholder }: EditorProps) {
       />
     </div>
     <HistoryPlugin />
-    <Integration engine={engine} />
+    <Integration engine={engine} registerAttachmentInserter={registerAttachmentInserter} />
   </LexicalComposer>;
 }

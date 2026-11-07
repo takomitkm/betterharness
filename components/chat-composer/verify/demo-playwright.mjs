@@ -276,9 +276,15 @@ test('B18: an actual renderer crash retains the uncertain message and the durabl
   const session = await context.newCDPSession(page);
   let timer;
   const crashed = new Promise((resolve) => page.once('crash', () => resolve(true)));
-  void session.send('Page.crash').catch(() => {});
-  const observed = await Promise.race([crashed, new Promise((resolve) => { timer = setTimeout(() => resolve(false), 3000); })]);
-  clearTimeout(timer);
+  // Page.crash 偶发第一次注入未命中（CDP attach 时序）；有界重试一次，不掩盖真失败。
+  let observed = false;
+  for (let attempt = 0; attempt < 2 && !observed; attempt++) {
+    void session.send('Page.crash').catch(() => {});
+    observed = await Promise.race([crashed, new Promise((resolve) => {
+      timer = setTimeout(() => resolve(false), attempt === 0 ? 1500 : 3000);
+    })]);
+    clearTimeout(timer);
+  }
   assert.equal(observed, true, 'The crash injection must actually hit the renderer');
   await page.close();
   const { page: restored } = await openPage(t, { context, scope });
@@ -304,4 +310,70 @@ test('B19: the executable host deduplicates admitted IDs and refuses a changed p
   assert.equal(results.duplicate.status, 'accepted');
   assert.equal(results.conflicting.status, 'unknown');
   assert.equal((await messages(page, scope)).length, 1);
+});
+
+// 有序文档形状：正文与附件节点按文档顺序交织（空文本节点不是内容，不参与断言）。
+const orderedOf = (page, index = 0) => page.evaluate((index) => {
+  const records = index === null
+    ? [window.composerTest.engine.getSnapshot().state.draft.snapshot]
+    : [window.composerTest.engine.getSnapshot().state.submissions[index]?.snapshot].filter(Boolean);
+  return records.map((snapshot) => snapshot.document.value.root.children[0].children
+    .filter((node) => node.type !== 'text' || node.text)
+    .map((node) => node.type).join('|'));
+}, index);
+const attachmentNodeIdOf = (page) => page.evaluate(() => {
+  const children = window.composerTest.engine.getSnapshot().state.draft.snapshot.document.value.root.children[0].children;
+  return children.find((node) => node.type === 'composer-attachment')?.nodeId;
+});
+
+test('B20: an attachment node keeps its place between words across reload, and double submit never duplicates it', async (t) => {
+  const { page, scope } = await openPage(t, { editor: 'rich' });
+  await editorOf(page).click();
+  await page.keyboard.type('AB');
+  await editorOf(page).press('ArrowLeft');
+  await page.getByTestId('files').setInputFiles({ name: '卡片.png', mimeType: 'image/png', buffer: Buffer.from('png-bytes') });
+  await page.waitForFunction(() => {
+    const view = window.composerTest.engine.getSnapshot();
+    const children = view.state.draft.snapshot.document?.value?.root?.children?.[0]?.children ?? [];
+    return !view.dirty && view.state.draft.snapshot.attachments.length === 1
+      && children.some((node) => node.type === 'composer-attachment');
+  });
+  assert.deepEqual(await orderedOf(page, null), ['text|composer-attachment|text']);
+  assert.equal(await page.locator('[data-testid=editor] .attachment').count(), 1);
+  const nodeId = await attachmentNodeIdOf(page);
+  // 刷新后草稿从 IndexedDB 恢复：有序内容与 NodeId 原样回来。
+  await page.reload(); await page.waitForFunction(() => Boolean(window.composerTest));
+  await page.locator('[data-testid=editor] .attachment').waitFor();
+  assert.deepEqual(await orderedOf(page, null), ['text|composer-attachment|text']);
+  assert.equal(await attachmentNodeIdOf(page), nodeId);
+  // 暂扣回执时提交；再按一次 Enter 不得产生第二条消息或重复附件。
+  await page.getByTestId('scenario').selectOption('hold');
+  await editorOf(page).press('Enter'); await held(page);
+  await editorOf(page).press('Enter');
+  assert.equal(await page.evaluate(() => window.composerTest.engine.getSnapshot().state.submissions.length), 1);
+  await page.getByTestId('release').click(); await waitStatus(page, 'accepted');
+  assert.equal(await textOf(page), '');
+  assert.equal(await page.evaluate(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.attachments.length), 0);
+  const records = await messages(page, scope);
+  assert.equal(records.length, 1);
+  const sent = records[0].snapshot;
+  assert.equal(sent.document.value.root.children[0].children
+    .filter((node) => node.type === 'composer-attachment').length, 1);
+  assert.equal(sent.attachments.length, 1);
+  assert.equal(Buffer.from(sent.attachments[0].bytes, 'base64').toString(), 'png-bytes');
+});
+
+test('B21: textarea mode keeps attachments rail-only — file add creates no ordered document', async (t) => {
+  const { page, scope } = await openPage(t, { editor: 'text' });
+  await page.getByTestId('files').setInputFiles({ name: 'rail.txt', mimeType: 'text/plain', buffer: Buffer.from('rail') });
+  await page.waitForFunction(() => {
+    const view = window.composerTest.engine.getSnapshot();
+    return !view.dirty && view.state.draft.snapshot.attachments.length === 1;
+  });
+  assert.equal(await page.evaluate(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.document), undefined);
+  await editorOf(page).press('Enter'); await waitStatus(page, 'accepted');
+  const records = await messages(page, scope);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].snapshot.document, undefined);
+  assert.equal(Buffer.from(records[0].snapshot.attachments[0].bytes, 'base64').toString(), 'rail');
 });

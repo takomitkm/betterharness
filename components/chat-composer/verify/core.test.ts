@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createComposer } from "../core.ts";
 import { MemoryComposerStore } from "../store.ts";
-import { emptySnapshot, textSnapshot } from "../snapshots.ts";
+import { emptySnapshot, textSnapshot, toAssetId } from "../snapshots.ts";
 import type { ComposerStore, ComposerTransport, DeliveryResult, ScopeState, SendRequest } from "../types.ts";
 
 function deferred<T>() {
@@ -175,7 +175,7 @@ test("FM08: attachment-only input is a message; snapshots and Blob bytes survive
   const snapshot = {
     ...emptySnapshot(),
     document: { format: "lexical", version: 1, value: { root: { children: [{ type: "mention", id: "person" }] } } },
-    attachments: [{ id: "file", name: "你好.txt", mediaType: "text/plain", data: new Blob(["payload"]) }],
+    attachments: [{ id: toAssetId("file"), name: "你好.txt", mediaType: "text/plain", data: new Blob(["payload"]) }],
     references: [{ id: "person", kind: "mention", value: { label: "Person" } }],
   };
   await engine.edit(snapshot);

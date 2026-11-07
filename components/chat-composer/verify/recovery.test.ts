@@ -66,6 +66,8 @@ test("FM19: cyclic or non-JSON document metadata is rejected without destroying 
     const cycle: Record<string, unknown> = {};
     cycle.self = cycle;
     assert.equal(await engine.edit({ ...textSnapshot("bad"), document: { format: "custom", version: 1, value: cycle as JsonValue } }), false);
+    // Date 不是 JSON 值：只有 validateJson 拦它（遍历和 structuredClone 都放行）。
+    assert.equal(await engine.edit({ ...textSnapshot("bad"), document: { format: "custom", version: 1, value: { when: new Date() } as unknown as JsonValue } }), false);
     assert.equal(engine.getSnapshot().state.draft.snapshot.text, "keep");
   } finally { await engine.close(); }
 });

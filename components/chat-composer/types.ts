@@ -1,15 +1,48 @@
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
+/**
+ * 品牌化身份类型：运行时就是非空 string，编译期防止与普通文本混用。
+ * - AssetId 标识一个附件资产（snapshot.attachments 的条目键）；
+ * - NodeId 标识有序文档中的一个节点。
+ * 两者都不是数组下标，也不是 blob URL；插入、移动、重排或恢复草稿时身份保持不变。
+ */
+export type AssetId = string & { readonly __brand: "AssetId" };
+export type NodeId = string & { readonly __brand: "NodeId" };
+
 export interface Attachment {
-  id: string;
+  /** AssetId：附件资产的稳定身份，有序文档中的附件节点通过 assetId 引用它。 */
+  id: AssetId;
   name: string;
   mediaType: string;
   /** Immutable bytes, persisted by IndexedDB. An object URL is never a durable file reference. */
   data: Blob;
 }
 
+/** 附件条目（以 AssetId 为键的 AssetMeta）：Blob 字节始终留在 JS 侧，从不进入 document.value。 */
+export type AssetMeta = Attachment;
+
+/**
+ * 有序文档中附件节点的约定形状。core 把 document.value 视为不透明 JSON（由编辑器拥有并序列化），
+ * 但 NodeId/AssetId 就住在 value 里：编辑器按此形状写入，validateSnapshot 按此形状校验引用完整性。
+ * 引用/提及节点继续携带既有的 referenceId（见 LexicalEditor 的 ComposerMentionNode）。
+ * 用 type alias（而非 interface）让它保持对 JsonValue 的隐式索引签名兼容。
+ */
+export type AttachmentNodeJson = {
+  type: "composer-attachment";
+  version: number;
+  nodeId: NodeId;
+  assetId: AssetId;
+};
+
 export interface ComposerSnapshot {
   text: string;
+  /**
+   * 有序文档（可选）。包装形态保持不变：{ format: "lexical", version, value }；
+   * value 对 core 不透明、由编辑器拥有，但 NodeId/AssetId 就住在 value 内部——
+   * 附件节点形如 { type: "composer-attachment", version, nodeId: NodeId, assetId: AssetId }。
+   * 文档与附件条目是同一份内容的两面：validateSnapshot 保证文档附件节点的 assetId
+   * 都能在 snapshot.attachments 里找到；未被文档引用的附件合法（rail-only）。
+   */
   document?: { format: string; version: number; value: JsonValue };
   attachments: Attachment[];
   references: { id: string; kind: string; value: JsonValue }[];
