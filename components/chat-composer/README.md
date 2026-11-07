@@ -179,7 +179,7 @@ store.close();
 
 - **编程 API**：宿主经 `registerAttachmentMover` 拿到入口（或直接调 `moveAttachmentNode`）。
 - **rail 卡片「前移/后移」按钮**：拖动的键盘/触屏替代（DSH 无此能力，#12506 提案；芯片拖拽把手暂缓）。目标下标由文档顺序换算：当前附件下标 ± 1。
-- **键盘**：光标紧邻附件节点时，Ctrl/Cmd+Shift+→ 把该节点移过后一个附件节点，Ctrl/Cmd+Shift+← 移过前一个（同方向没有更多附件时钳到端点 = 无操作）。COMMAND_PRIORITY_HIGH，与菜单（↑/↓/Esc）、Enter 仲裁、粘贴键位互不重叠；组合中的方向键属于输入法。
+- **键盘**：光标紧邻附件节点时，Ctrl/Cmd+Shift+→ 把该节点移过后一个附件节点，Ctrl/Cmd+Shift+← 移过前一个（同方向没有更多附件时钳到端点 = 无操作）。实现是编辑器根元素上的原生 keydown 监听（经 `registerRootListener` 挂载）：Lexical 对 Ctrl/Cmd+Shift+方向键不派发 `KEY_ARROW_*_COMMAND`（其快捷键掩码把未声明的修饰键当「必须为 false」匹配），且内部选区在 composer-sync `setEditorState` 之后可能滞后于浏览器原生移动的光标，所以目标解析以 **DOM 选区为事实源**（`$domAdjacentAttachment` 把 DOM 光标邻位经 `$getNearestNodeFromDOMNode` 映射回附件节点）。与菜单（↑/↓/Esc）、Enter 仲裁、粘贴键位互不重叠；组合中的方向键属于输入法。
 
 不对称：纯文本（textarea）模式没有有序文档，附件保持 rail-only，无移动（`registerAttachmentMover` 不注册，rail 不渲染移动按钮）。
 
