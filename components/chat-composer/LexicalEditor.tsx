@@ -13,7 +13,8 @@ import {
 } from "lexical";
 import type { EditorProps } from "./ChatComposer.tsx";
 import type { AssetId, JsonValue, NodeId } from "./types.ts";
-import { copy, isEmptyDraft, newNodeId } from "./snapshots.ts";
+import { copy, hasContent, isEmptyDraft, newNodeId } from "./snapshots.ts";
+import { ImeTracker, decideEnter } from "./key-decision.ts";
 import { useComposerSubmission } from "./useComposerSubmission.ts";
 
 type SerializedMention = SerializedTextNode & { referenceId: string };
@@ -112,6 +113,31 @@ function Integration({ engine, registerAttachmentInserter }: EditorProps) {
   const draft = view.state.draft;
   // 文件选择器抢焦点后活动选区为空；记住最后的文本选区，附件节点仍插回原位置。
   const lastSelectionRef = useRef<RangeSelection | null>(null);
+  // Enter/IME 仲裁：根元素上的真实组合事件喂给 tracker，Enter 裁决统一交给 key-decision。
+  const imeRef = useRef<ImeTracker | null>(null);
+  if (!imeRef.current) imeRef.current = new ImeTracker();
+
+  useEffect(() => {
+    const ime = imeRef.current!;
+    const start = () => ime.onCompositionStart();
+    const end = () => ime.onCompositionEnd(Date.now());
+    let attached: HTMLElement | null = null;
+    const detach = () => {
+      attached?.removeEventListener("compositionstart", start);
+      attached?.removeEventListener("compositionend", end);
+      attached = null;
+    };
+    return editor.registerRootListener((root) => {
+      detach();
+      // 根元素被替换时重置组合状态（DSH 同款）：旧根上未结束的组合不得泄漏进新根。
+      ime.reset();
+      if (root) {
+        root.addEventListener("compositionstart", start);
+        root.addEventListener("compositionend", end);
+        attached = root;
+      }
+    });
+  }, [editor]);
 
   useEffect(() => {
     return editor.registerUpdateListener(({ editorState }) => {
@@ -155,9 +181,26 @@ function Integration({ engine, registerAttachmentInserter }: EditorProps) {
 
   useEffect(() => {
     const enter = editor.registerCommand(KEY_ENTER_COMMAND, (event) => {
-      if (!event || event.isComposing || event.shiftKey || event.altKey) return false;
-      engine.handleKey(event);
-      return true;
+      if (!event) return false;
+      const nowMs = Date.now();
+      const ime = imeRef.current!.isComposing(nowMs);
+      const current = engine.getSnapshot();
+      const verdict = decideEnter({
+        key: event.key, shiftKey: event.shiftKey, altKey: event.altKey, ctrlKey: event.ctrlKey, metaKey: event.metaKey,
+        isComposing: event.isComposing, keyCode: event.keyCode, repeat: event.repeat ?? false,
+        composing: ime.composing, composingUntilMs: ime.composingUntilMs, nowMs,
+        // 步骤 3（@/slash 候选菜单）接入后由菜单状态填充；当前恒为 false。
+        hasMenu: false,
+        canSubmit: !current.admitting && !current.closed && !current.sending && hasContent(current.state.draft.snapshot),
+      });
+      if (verdict.preventDefault) event.preventDefault();
+      switch (verdict.kind) {
+        case "hand-to-ime": return true; // 只停掉 Lexical 的 Enter 后备，不拦截浏览器——中文确认交给输入法。
+        case "submit": engine.handleKey(event); return true; // 既有提交路径：preventDefault + 引擎自有守卫不变。
+        case "newline": return false; // 交回 Lexical 纯文本后备插入换行（DSH：Shift+Enter 返回 false），不能自己吞掉默认行为。
+        case "menu": return true; // 步骤 3 接管菜单确认；先占住仲裁位，绝不落到发送。
+        case "noop": return true;
+      }
     }, COMMAND_PRIORITY_HIGH);
     const up = editor.registerCommand(KEY_ARROW_UP_COMMAND, (event) => {
       if (!event || event.shiftKey || event.ctrlKey || event.metaKey || !isEmptyDraft(engine.getSnapshot().state.draft.snapshot)) return false;

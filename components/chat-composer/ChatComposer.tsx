@@ -1,6 +1,7 @@
 import { useCallback, useRef, type ComponentType } from "react";
 import type { ComposerEngine } from "./core.ts";
 import { copy, documentWithoutAttachment, hasContent, isEmptyDraft, newAssetId } from "./snapshots.ts";
+import { ImeTracker, decideEnter } from "./key-decision.ts";
 import { useComposerSubmission } from "./useComposerSubmission.ts";
 import type { AssetId } from "./types.ts";
 
@@ -16,15 +17,33 @@ export interface EditorProps {
 
 export function TextareaEditor({ engine, placeholder }: EditorProps) {
   const view = useComposerSubmission(engine);
+  // Enter/IME 仲裁与 LexicalEditor 同源：组合事件喂给 tracker，Enter 裁决统一交给 key-decision。
+  const imeRef = useRef<ImeTracker | null>(null);
+  if (!imeRef.current) imeRef.current = new ImeTracker();
   return <textarea
     data-testid="editor" aria-label="消息" rows={4} placeholder={placeholder}
     value={view.state.draft.snapshot.text} readOnly={view.admitting || view.closed}
+    onCompositionStart={() => imeRef.current!.onCompositionStart()}
+    onCompositionEnd={() => imeRef.current!.onCompositionEnd(Date.now())}
     onChange={(event) => {
       const current = engine.getSnapshot().state.draft.snapshot;
       void engine.edit({ ...copy(current), text: event.target.value, document: undefined, references: current.references.filter((reference) => reference.kind !== "mention") });
     }}
     onKeyDown={(event) => {
-      engine.handleKey(event);
+      const current = engine.getSnapshot();
+      const nowMs = Date.now();
+      const ime = imeRef.current!.isComposing(nowMs);
+      const verdict = decideEnter({
+        key: event.key, shiftKey: event.shiftKey, altKey: event.altKey, ctrlKey: event.ctrlKey, metaKey: event.metaKey,
+        isComposing: event.nativeEvent.isComposing, keyCode: event.nativeEvent.keyCode, repeat: event.repeat ?? false,
+        composing: ime.composing, composingUntilMs: ime.composingUntilMs, nowMs,
+        // 纯文本编辑器没有候选菜单；hasMenu 只在富文本侧（步骤 3）可能为真。
+        hasMenu: false,
+        canSubmit: !current.admitting && !current.closed && !current.sending && hasContent(current.state.draft.snapshot),
+      });
+      // hand-to-ime / newline：不拦截浏览器（输入法确认 / textarea 默认换行）；其余按裁决拦截。
+      if (verdict.preventDefault) event.preventDefault();
+      if (verdict.kind === "submit") engine.handleKey(event); // 既有提交路径：引擎自有守卫不变。
       if (event.key === "ArrowUp" && !event.shiftKey && !event.ctrlKey && !event.metaKey && isEmptyDraft(engine.getSnapshot().state.draft.snapshot)) {
         event.preventDefault(); void engine.takeLatestQueued();
       }

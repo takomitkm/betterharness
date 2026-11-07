@@ -205,6 +205,16 @@ test('B12: Shift+Enter is a real newline; composition confirmation and held-key 
   await page.waitForFunction(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.text === 'L1\nL2');
   await editorOf(page).dispatchEvent('keydown', { key: 'Enter', code: 'Enter', isComposing: true });
   assert.equal((await rowsOf(page)).length, 0);
+  // 组合刚结束的 10ms 宽限期内，普通 Enter 也不提交：三个事件必须在同一个 JS tick 里派发，
+  // 保证 compositionend 与 Enter 的间隔小于宽限窗口（跨 Playwright 调用会超过 10ms，测不到窗口）。
+  await page.evaluate(() => {
+    const editor = document.querySelector('[data-testid=editor]');
+    editor.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, data: 'A' }));
+    editor.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: 'A' }));
+    editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+  });
+  assert.equal((await rowsOf(page)).length, 0);
+  assert.equal(await textOf(page), 'L1\nL2');
   await page.getByTestId('scenario').selectOption('hold');
   await page.keyboard.down('Enter'); await page.keyboard.down('Enter'); await page.keyboard.up('Enter');
   await held(page); await page.getByTestId('release').click(); await waitStatus(page, 'accepted');
@@ -273,15 +283,15 @@ test('B17: failed receipt persistence retries only the local write and preserves
 test('B18: an actual renderer crash retains the uncertain message and the durable successor draft', async (t) => {
   const { page, context, scope } = await openPage(t);
   await send(page, 'A', 'hold'); await held(page); await type(page, 'B');
-  const session = await context.newCDPSession(page);
+  // Page.crash 偶发注入未命中（CDP 会话/负载时序）；每次尝试新建 CDP 会话，最多 3 次。
   let timer;
   const crashed = new Promise((resolve) => page.once('crash', () => resolve(true)));
-  // Page.crash 偶发第一次注入未命中（CDP attach 时序）；有界重试一次，不掩盖真失败。
   let observed = false;
-  for (let attempt = 0; attempt < 2 && !observed; attempt++) {
+  for (let attempt = 0; attempt < 3 && !observed; attempt++) {
+    const session = await context.newCDPSession(page);
     void session.send('Page.crash').catch(() => {});
     observed = await Promise.race([crashed, new Promise((resolve) => {
-      timer = setTimeout(() => resolve(false), attempt === 0 ? 1500 : 3000);
+      timer = setTimeout(() => resolve(false), 2000);
     })]);
     clearTimeout(timer);
   }

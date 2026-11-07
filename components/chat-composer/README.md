@@ -38,6 +38,7 @@ queued ── 保存 sending 标记 ──► sending ──► accepted
 | `useComposerSubmission.ts` | `useSyncExternalStore` 订阅，不在渲染或 state updater 里执行发送 |
 | `ChatComposer.tsx` | 纯文本输入、附件、提交记录、失败/未知恢复入口 |
 | `LexicalEditor.tsx` | 真实 Lexical 编辑器、mention token、JSON 恢复和历史隔离 |
+| `key-decision.ts` | Enter/IME 仲裁：注入时钟的纯函数裁决与组合状态跟踪，「是否继续处理」与「是否拦截浏览器」两条决策分开表达 |
 | `http-transport.ts` | 示例 HTTP 绑定：完整快照、幂等键、回执查询 |
 | `demo.tsx` / `demo.html` | 使用上述生产实现的交互演示，不另写一套状态机 |
 | `verify/` | 核心故障测试、真实浏览器测试、临时副本变异验证与演示服务 |
@@ -118,7 +119,7 @@ store.close();
 - Enter、Ctrl/Cmd+Enter：发送；在当前请求等待接纳时消费为无操作。
 - 空 Enter、发送键 Repeat：不创建消息、不插换行。
 - Shift+Enter / Alt+Enter：明确换行。
-- IME 组合确认：交给输入法。
+- IME 组合确认：交给输入法；组合结束后 10ms 宽限期内仍按组合处理（防 Safari 把确认键再报成普通 Enter）。
 - 空编辑器的 Up：取回最近一条尚未派发的排队消息；有空白、附件或引用时也不覆盖。
 - `queue`：完整快照入队；对应轮次结束后只派发下一条，等新轮次结束再推进。
 - `steer`：向当前轮次提交；`none`：保留草稿不投递。
