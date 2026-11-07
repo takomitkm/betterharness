@@ -39,6 +39,8 @@ queued ── 保存 sending 标记 ──► sending ──► accepted
 | `ChatComposer.tsx` | 纯文本输入、附件、提交记录、失败/未知恢复入口 |
 | `LexicalEditor.tsx` | 真实 Lexical 编辑器、mention token、JSON 恢复和历史隔离 |
 | `key-decision.ts` | Enter/IME 仲裁：注入时钟的纯函数裁决与组合状态跟踪，「是否继续处理」与「是否拦截浏览器」两条决策分开表达 |
+| `completion.ts` | 候选菜单纯状态机（零依赖）：@/slash 触发检测、查询代次守卫（纯化的 AbortController）、高亮与选择写回计算 |
+| `CandidateMenu.tsx` | 候选菜单列表框：aria-activedescendant、行 mousedown 保持编辑器选区、真实 mousemove 移动高亮、外部按下关闭 |
 | `http-transport.ts` | 示例 HTTP 绑定：完整快照、幂等键、回执查询 |
 | `demo.tsx` / `demo.html` | 使用上述生产实现的交互演示，不另写一套状态机 |
 | `verify/` | 核心故障测试、真实浏览器测试、临时副本变异验证与演示服务 |
@@ -120,11 +122,32 @@ store.close();
 - 空 Enter、发送键 Repeat：不创建消息、不插换行。
 - Shift+Enter / Alt+Enter：明确换行。
 - IME 组合确认：交给输入法；组合结束后 10ms 宽限期内仍按组合处理（防 Safari 把确认键再报成普通 Enter）。
+- 候选菜单开启时：Enter 只确认高亮候选（不发送不换行），↑/↓ 移动高亮，Esc 关闭；pending 时 Enter 被吞掉。
 - 空编辑器的 Up：取回最近一条尚未派发的排队消息；有空白、附件或引用时也不覆盖。
 - `queue`：完整快照入队；对应轮次结束后只派发下一条，等新轮次结束再推进。
 - `steer`：向当前轮次提交；`none`：保留草稿不投递。
 
 `endTurn(id)` 使用明确的轮次身份；迟到的结束事件不能结束另一轮，迟到的接纳也不能复活已经结束的轮次。
+
+## 候选菜单（@ 与 /）
+
+富文本编辑器内置 @（`reference`）与 /（`slash`）候选菜单，候选来源由宿主提供：
+
+```tsx
+<ChatComposer
+  engine={engine}
+  Editor={LexicalEditor}
+  completionProvider={(kind, query) =>
+    kind === "reference" ? searchFiles(query) : searchCommands(query)}
+/>
+```
+
+- `completionProvider(kind, query)` 返回 `{ label, insertText }[]` 或其 Promise；缺省时富文本侧也不开菜单。
+- **范围（v1）**：菜单只在富文本（Lexical）模式生效。纯文本模式暂不接菜单，与附件 rail-only 是同款的不对称——textarea 保持现状；`applyPickToText` 的纯文本写回计算已就绪但未接线。
+- 触发规则（对齐 DSH，v1 简化）：从光标向前扫描到最近的 @ 或 /，查询不跨空白；触发符前不能是字母/数字/下划线（邮箱、路径不算）；slash 额外排除 `//` 与 `scheme:/`。DSH 完整的带引号路径语法不在本范围内。
+- **过期保护**：查询变更即换代次；旧查询的迟到结果按代次拒绝，pending 期间候选不可选、Enter 只确认菜单不发送。
+- **一次选择一次 Undo**：选择写回（@ → mention token 节点 + 补尾空格；/ → 命令回显文本 + 补尾空格）在同一个 editor.update 内完成，光标落在空格之后。
+- 键盘：Enter 确认高亮项（菜单裁决先于 repeat/submit）；↑/↓ 在就绪候选间循环移动；Esc 关闭且同一条目不立刻弹回；点击菜单与输入框之外关闭。组合（IME）中的按键一律先交给输入法，组合结束后的宽限窗口内同样不检测触发。
 
 ## 本地运行与验证
 

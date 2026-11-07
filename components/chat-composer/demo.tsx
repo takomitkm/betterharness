@@ -1,12 +1,32 @@
 import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ChatComposer, TextareaEditor } from "./ChatComposer.tsx";
+import { ChatComposer, TextareaEditor, type CompletionProvider } from "./ChatComposer.tsx";
 import { LexicalEditor } from "./LexicalEditor.tsx";
 import { createComposer } from "./core.ts";
 import { IndexedDbComposerStore } from "./store.ts";
 import { createHttpTransport } from "./http-transport.ts";
 import { useComposerSubmission } from "./useComposerSubmission.ts";
 import type { ComposerStore } from "./types.ts";
+
+// 演示候选源：固定内存列表（@ 文件引用、/ 命令回显）。生产宿主在这里接真实的文件/命令检索。
+const DEMO_REFERENCES = [
+  { label: "field-report.md", insertText: "@field-report.md" },
+  { label: "final-notes.md", insertText: "@final-notes.md" },
+  { label: "s1-alpha.md", insertText: "@s1-alpha.md" },
+  { label: "s2-beta.md", insertText: "@s2-beta.md" },
+  { label: "服务器架构.png", insertText: "@服务器架构.png" },
+];
+const DEMO_COMMANDS = [
+  { label: "/help 帮助", insertText: "/帮助" },
+  { label: "/clear 清理上下文", insertText: "/清理上下文" },
+];
+const demoCompletionProvider: CompletionProvider = (kind, query) => {
+  const source = kind === "reference" ? DEMO_REFERENCES : DEMO_COMMANDS;
+  const needle = query.toLowerCase();
+  return source.filter((item) => item.label.toLowerCase().includes(needle) || item.insertText.toLowerCase().includes(needle));
+};
+// 浏览器测试经 composerTest.setCompletionProvider 注入慢/快候选源替身，验证代次守卫。
+let completionOverride: CompletionProvider | null = null;
 
 const parameters = new URLSearchParams(location.search);
 const scopeId = parameters.get("scope") ?? "demo/main";
@@ -41,6 +61,7 @@ Object.assign(window, {
     holdWrite() { holdWrite = true; writeGateHit = false; },
     get writeGateHit() { return writeGateHit; },
     releaseWrite() { releaseWrite?.(); releaseWrite = null; },
+    setCompletionProvider(provider: CompletionProvider | null) { completionOverride = provider; },
   },
 });
 
@@ -73,7 +94,11 @@ function App() {
         <option value="lost-ack">已接纳但丢失回执</option><option value="hold">暂扣回执</option>
       </select></label>
     </section>
-    <ChatComposer engine={engine} Editor={editor === "rich" ? LexicalEditor : TextareaEditor} />
+    <ChatComposer
+      engine={engine}
+      Editor={editor === "rich" ? LexicalEditor : TextareaEditor}
+      completionProvider={(kind, query) => (completionOverride ?? demoCompletionProvider)(kind, query)}
+    />
     <section className="host-controls" aria-label="宿主事件演示">
       <button type="button" data-testid="end-turn" disabled={!view.state.activeTurn} onClick={() => {
         if (view.state.activeTurn) void engine.endTurn(view.state.activeTurn);

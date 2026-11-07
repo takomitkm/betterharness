@@ -387,3 +387,87 @@ test('B21: textarea mode keeps attachments rail-only — file add creates no ord
   assert.equal(records[0].snapshot.document, undefined);
   assert.equal(Buffer.from(records[0].snapshot.attachments[0].bytes, 'base64').toString(), 'rail');
 });
+
+test('B22: @ menu pick inserts a reference node in one undo step, then Enter submits once', async (t) => {
+  const { page, scope } = await openPage(t, { editor: 'rich' });
+  await editorOf(page).click();
+  await page.keyboard.type('@fi');
+  await page.getByTestId('candidate-menu').waitFor();
+  await page.waitForFunction(() => {
+    const options = [...document.querySelectorAll('[data-testid=candidate-option]')];
+    return options.map((option) => option.textContent).join(',') === 'field-report.md,final-notes.md';
+  });
+  // 第一个候选自动高亮；↓ 移动共享高亮后 Enter 只确认菜单项。
+  await editorOf(page).press('ArrowDown');
+  await page.waitForFunction(() => document.querySelector('[data-testid=candidate-option][aria-selected="true"]')?.textContent === 'final-notes.md');
+  await editorOf(page).press('Enter');
+  await page.waitForFunction(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.references.length === 1);
+  assert.equal(await page.locator('[data-testid=editor] .mention').count(), 1);
+  // 一次选择一次 Undo：一步撤销回到触发文本本身；同身份命中被抑制，菜单不立刻弹回。
+  await editorOf(page).press(process.platform === 'darwin' ? 'Meta+z' : 'Control+z');
+  await page.waitForFunction(() => {
+    const view = window.composerTest.engine.getSnapshot();
+    return view.state.draft.snapshot.text === '@fi' && view.state.draft.snapshot.references.length === 0;
+  });
+  await page.waitForFunction(() => !document.querySelector('[data-testid=candidate-menu]'));
+  // 重新补全：查询身份变化后菜单重新出现，Enter 接受自动高亮的首个候选。
+  await page.keyboard.press('Backspace');
+  await page.getByTestId('candidate-menu').waitFor();
+  await page.keyboard.type('i');
+  await page.waitForFunction(() => document.querySelectorAll('[data-testid=candidate-option]').length === 2);
+  await editorOf(page).press('Enter');
+  await page.waitForFunction(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.references.length === 1);
+  // 菜单已随选择关闭：现在 Enter 是发送，重复 Enter 不产生第二条消息。
+  await page.getByTestId('scenario').selectOption('hold');
+  await editorOf(page).press('Enter'); await held(page);
+  await editorOf(page).press('Enter');
+  assert.equal(await page.evaluate(() => window.composerTest.engine.getSnapshot().state.submissions.length), 1);
+  await page.getByTestId('release').click(); await waitStatus(page, 'accepted');
+  const records = await messages(page, scope);
+  assert.equal(records.length, 1);
+  const sent = records[0].snapshot;
+  assert.equal(sent.references.length, 1);
+  assert.equal(sent.references[0].value.label, '@field-report.md');
+  // 有序文档：mention 芯片 + 补尾空格按真实顺序保留到送达载荷。
+  assert.deepEqual(await orderedOf(page, 0), ['composer-mention|text']);
+});
+
+test('B23: stale query results are unpickable — slow old query is ignored, pending Enter never submits', async (t) => {
+  const { page, scope } = await openPage(t, { editor: 'rich' });
+  // 演示覆盖钩子注入慢/快候选源替身：s1 查询最慢（800ms），s2 查询 300ms，其余 120ms。
+  await page.evaluate(() => window.composerTest.setCompletionProvider((kind, query) => new Promise((resolve) => {
+    const source = kind === 'reference'
+      ? [{ label: 's1-alpha.md', insertText: '@s1-alpha.md' }, { label: 's2-beta.md', insertText: '@s2-beta.md' }]
+      : [];
+    const delay = query === 's1' ? 800 : query === 's2' ? 300 : 120;
+    setTimeout(() => resolve(source.filter((item) => item.label.includes(query))), delay);
+  })));
+  await editorOf(page).click();
+  await page.keyboard.type('@s1');
+  // 快速回退一位并输入 2：查询 s1 → s → s2 连续换代，慢的 s1 结果稍后才会到达。
+  await page.keyboard.press('Backspace');
+  await page.keyboard.type('2');
+  // 当前查询 s2 尚未就绪（pending）：菜单开着，Enter 只确认菜单，绝不发送。
+  await page.getByTestId('candidate-menu').waitFor();
+  await editorOf(page).press('Enter');
+  assert.equal((await rowsOf(page)).length, 0);
+  assert.equal((await messages(page, scope)).length, 0);
+  // s2 结果就绪后菜单里只有它；再等足慢查询的时限，s1 的迟到结果也不得混入。
+  await page.waitForFunction(() => {
+    const options = [...document.querySelectorAll('[data-testid=candidate-option]')];
+    return options.length === 1 && options[0].textContent === 's2-beta.md';
+  });
+  await page.waitForTimeout(1000);
+  assert.deepEqual(await page.evaluate(() => [...document.querySelectorAll('[data-testid=candidate-option]')].map((option) => option.textContent)), ['s2-beta.md']);
+  // 首个（唯一）候选自动高亮：Enter 选中 s2，写回 mention 芯片。
+  await editorOf(page).press('Enter');
+  await page.waitForFunction(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.references.length === 1);
+  assert.equal(await page.evaluate(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.references[0].value.label), '@s2-beta.md');
+  await page.getByTestId('scenario').selectOption('hold');
+  await editorOf(page).press('Enter'); await held(page);
+  await page.getByTestId('release').click(); await waitStatus(page, 'accepted');
+  const records = await messages(page, scope);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].snapshot.references.length, 1);
+  assert.deepEqual(await orderedOf(page, 0), ['composer-mention|text']);
+});

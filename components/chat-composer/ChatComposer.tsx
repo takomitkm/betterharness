@@ -3,7 +3,11 @@ import type { ComposerEngine } from "./core.ts";
 import { copy, documentWithoutAttachment, hasContent, isEmptyDraft, newAssetId } from "./snapshots.ts";
 import { ImeTracker, decideEnter } from "./key-decision.ts";
 import { useComposerSubmission } from "./useComposerSubmission.ts";
+import type { Candidate, TriggerKind } from "./completion.ts";
 import type { AssetId } from "./types.ts";
+
+/** 候选来源（宿主提供）：reference 对应 @，slash 对应 /；返回候选数组或其 Promise。 */
+export type CompletionProvider = (kind: TriggerKind, query: string) => Candidate[] | Promise<Candidate[]>;
 
 export interface EditorProps {
   engine: ComposerEngine;
@@ -13,6 +17,11 @@ export interface EditorProps {
    * 纯文本编辑器不注册：其文档只是纯文本，附件保持 rail-only，不进有序文档（见 ChatComposer）。
    */
   registerAttachmentInserter?: (insert: ((assetId: AssetId) => void) | null) => void;
+  /**
+   * 候选菜单来源。缺省时富文本侧也不开菜单。旧查询的迟到结果由组件内的代次守卫拒绝；
+   * 纯文本编辑器不使用（菜单暂缓，与 rail-only 附件同款的不对称，见 README）。
+   */
+  completionProvider?: CompletionProvider;
 }
 
 export function TextareaEditor({ engine, placeholder }: EditorProps) {
@@ -37,7 +46,8 @@ export function TextareaEditor({ engine, placeholder }: EditorProps) {
         key: event.key, shiftKey: event.shiftKey, altKey: event.altKey, ctrlKey: event.ctrlKey, metaKey: event.metaKey,
         isComposing: event.nativeEvent.isComposing, keyCode: event.nativeEvent.keyCode, repeat: event.repeat ?? false,
         composing: ime.composing, composingUntilMs: ime.composingUntilMs, nowMs,
-        // 纯文本编辑器没有候选菜单；hasMenu 只在富文本侧（步骤 3）可能为真。
+        // 纯文本编辑器不接候选菜单（与 rail-only 附件同款的不对称，见 README 范围说明）：
+        // completion 状态机只接富文本侧，这里 hasMenu 恒为 false。
         hasMenu: false,
         canSubmit: !current.admitting && !current.closed && !current.sending && hasContent(current.state.draft.snapshot),
       });
@@ -57,8 +67,8 @@ const statusLabels = {
 };
 
 /** The host provides a durable engine and optionally a rich editor. There is no implicit-success transport. */
-export function ChatComposer({ engine, Editor = TextareaEditor, placeholder = "写下一条消息…" }: {
-  engine: ComposerEngine; Editor?: ComponentType<EditorProps>; placeholder?: string;
+export function ChatComposer({ engine, Editor = TextareaEditor, placeholder = "写下一条消息…", completionProvider }: {
+  engine: ComposerEngine; Editor?: ComponentType<EditorProps>; placeholder?: string; completionProvider?: CompletionProvider;
 }) {
   const view = useComposerSubmission(engine);
   const snapshot = view.state.draft.snapshot;
@@ -67,7 +77,7 @@ export function ChatComposer({ engine, Editor = TextareaEditor, placeholder = "�
     inserterRef.current = insert;
   }, []);
   return <section className="chat-composer" aria-label="聊天输入框">
-    <Editor engine={engine} placeholder={placeholder} registerAttachmentInserter={registerAttachmentInserter} />
+    <Editor engine={engine} placeholder={placeholder} registerAttachmentInserter={registerAttachmentInserter} completionProvider={completionProvider} />
     <div className="attachments" aria-label="草稿附件">
       {snapshot.attachments.map((file) => <span key={file.id}>
         {file.name} ({file.data.size} B)
