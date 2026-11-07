@@ -42,6 +42,7 @@ queued ── 保存 sending 标记 ──► sending ──► accepted
 | `completion.ts` | 候选菜单纯状态机（零依赖）：@/slash 触发检测、查询代次守卫（纯化的 AbortController）、高亮与选择写回计算 |
 | `CandidateMenu.tsx` | 候选菜单列表框：aria-activedescendant、行 mousedown 保持编辑器选区、真实 mousemove 移动高亮、外部按下关闭 |
 | `intake.ts` | 文件准入纯模块（零依赖）：IntakePolicy/intakeFiles 整批与逐文件裁决、splitClipboard 粘贴路由判定、formatBytes |
+| `reorder.ts` | 附件重排纯模块（零依赖）：附件序列上的移动跨度 computeMoveSpan（目标下标钳制、同位无操作） |
 | `AttachmentCards.tsx` | 附件呈现：横向 rail（翻页箭头/滚轮横滚）、图片缩略图 + 灯箱、文件卡、全视口拖放遮罩；object-URL 生命周期归每个视图所有 |
 | `http-transport.ts` | 示例 HTTP 绑定：完整快照、幂等键、回执查询 |
 | `demo.tsx` / `demo.html` | 使用上述生产实现的交互演示，不另写一套状态机 |
@@ -165,6 +166,22 @@ store.close();
 **呈现**（`AttachmentCards.tsx`）：横向 rail，图片缩略图（object-URL 预览，点击开灯箱，附件被移除时预览随关）与文件卡（类型占位符/扩展名首字母、名称、扩展名 + 大小、移除）；边缘翻页箭头按滚动几何 + `ResizeObserver` 重算；滚轮只横滚 rail（非 passive、LINE/PAGE 增量归一、每格钳制、reduced-motion 降级）；新附件滚入视野，rail 重新挂载保持起始位置。
 
 **范围与后续（宿主集成点）**：字节始终在本地，发送载荷直接携带它们，因此这里没有 DSH 的上传生命周期——`FileCard`/图片缩略图的 uploading/ready/error 状态、进度轨道、失败重试（可重试错误与明确拒绝分开）是留给真实宿主上传管线的集成点，本组件不伪造进度。粘贴文件入口目前只在富文本编辑器接线（textarea 的 paste-files 暂缓，与菜单 rail-only 同款不对称）；拖放在两种模式都可用（textarea 模式附件保持 rail-only，不进有序文档）。
+
+## 正文中的附件节点与移动（富文本）
+
+富文本模式把附件作为有序文档里的节点（`ComposerAttachmentNode`，DOM 带 `data-node-id`/`data-asset-id`）插在光标处；插入、移动、删除各是一次 `editor.update` = 一步 Undo。
+
+**移动语义**（`moveAttachmentNode(editor, assetId, targetIndex)`，跨度计算在零依赖的 `reorder.ts`）：`targetIndex` 是**整篇文档附件节点序列**里的下标（0 起）——按文档顺序枚举全部附件节点，移动后该节点必须成为其中第 `targetIndex` 个。目标越界钳制到 `[0, 数量-1]`，已在目标位时无操作。落点：摘除后插到其余附件的第 `targetIndex` 个之前；目标是末位时插在最后一个其余附件之后；没有其余附件时追加到文档末尾段落。跨段落移动天然支持——锚点附件在哪个段落，节点就插到哪个段落。移动**保留节点实例**：Lexical key 与 NodeId/AssetId 不变，React 不重挂载。
+
+**不变量：引擎不参与移动。** 移动只改有序文档里的节点顺序；outbox、`attachments` 列表（rail 的顺序）、object-URL 一概不动。新顺序经编辑器 onChange 正常回写草稿，随消息快照一起送达。
+
+三个移动入口（同一注册的 mover，rail-only 之外都只做转发）：
+
+- **编程 API**：宿主经 `registerAttachmentMover` 拿到入口（或直接调 `moveAttachmentNode`）。
+- **rail 卡片「前移/后移」按钮**：拖动的键盘/触屏替代（DSH 无此能力，#12506 提案；芯片拖拽把手暂缓）。目标下标由文档顺序换算：当前附件下标 ± 1。
+- **键盘**：光标紧邻附件节点时，Ctrl/Cmd+Shift+→ 把该节点移过后一个附件节点，Ctrl/Cmd+Shift+← 移过前一个（同方向没有更多附件时钳到端点 = 无操作）。COMMAND_PRIORITY_HIGH，与菜单（↑/↓/Esc）、Enter 仲裁、粘贴键位互不重叠；组合中的方向键属于输入法。
+
+不对称：纯文本（textarea）模式没有有序文档，附件保持 rail-only，无移动（`registerAttachmentMover` 不注册，rail 不渲染移动按钮）。
 
 ## 本地运行与验证
 

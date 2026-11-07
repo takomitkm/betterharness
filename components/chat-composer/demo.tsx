@@ -1,13 +1,13 @@
 import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ChatComposer, TextareaEditor, type CompletionProvider } from "./ChatComposer.tsx";
+import { ChatComposer, TextareaEditor, type CompletionProvider, type EditorProps } from "./ChatComposer.tsx";
 import { LexicalEditor } from "./LexicalEditor.tsx";
 import { createComposer } from "./core.ts";
 import { IndexedDbComposerStore } from "./store.ts";
 import { createHttpTransport } from "./http-transport.ts";
 import { useComposerSubmission } from "./useComposerSubmission.ts";
 import type { IntakePolicy } from "./intake.ts";
-import type { ComposerStore } from "./types.ts";
+import type { AssetId, ComposerStore } from "./types.ts";
 
 // 演示准入策略：真实可触发的上限（通用文件，不做图片白名单）——
 // 超 2 MiB 的文件按单文件大小逐文件拒绝（不连坐同批正常文件），第 7 个文件整批拒绝。
@@ -35,6 +35,17 @@ const demoCompletionProvider: CompletionProvider = (kind, query) => {
 };
 // 浏览器测试经 composerTest.setCompletionProvider 注入慢/快候选源替身，验证代次守卫。
 let completionOverride: CompletionProvider | null = null;
+
+// 浏览器测试经 composerTest.moveAttachment 直接调用 moveAttachmentNode（rail 按钮之外的
+// 编程路径）。编辑器挂载时把注册进来的移动入口镜像到这里，卸载时（含 StrictMode 重挂）置回 null。
+let testAttachmentMover: ((assetId: AssetId, targetAttachmentIndex: number) => void) | null = null;
+
+function DemoLexicalEditor(props: EditorProps) {
+  return <LexicalEditor {...props} registerAttachmentMover={(move) => {
+    testAttachmentMover = move;
+    props.registerAttachmentMover?.(move);
+  }} />;
+}
 
 const parameters = new URLSearchParams(location.search);
 const scopeId = parameters.get("scope") ?? "demo/main";
@@ -70,6 +81,9 @@ Object.assign(window, {
     get writeGateHit() { return writeGateHit; },
     releaseWrite() { releaseWrite?.(); releaseWrite = null; },
     setCompletionProvider(provider: CompletionProvider | null) { completionOverride = provider; },
+    moveAttachment(assetId: string, targetAttachmentIndex: number) {
+      testAttachmentMover?.(assetId as AssetId, targetAttachmentIndex);
+    },
   },
 });
 
@@ -104,7 +118,7 @@ function App() {
     </section>
     <ChatComposer
       engine={engine}
-      Editor={editor === "rich" ? LexicalEditor : TextareaEditor}
+      Editor={editor === "rich" ? DemoLexicalEditor : TextareaEditor}
       completionProvider={(kind, query) => (completionOverride ?? demoCompletionProvider)(kind, query)}
       intakePolicy={DEMO_INTAKE_POLICY}
     />

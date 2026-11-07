@@ -96,7 +96,12 @@ function validateJson(value: unknown, ancestors = new Set<object>(), depth = 0):
     throw new Error("Document metadata must contain plain JSON values");
   }
   ancestors.add(value);
-  for (const child of Object.values(value)) validateJson(child, ancestors, depth + 1);
+  for (const child of Object.values(value)) {
+    // undefined 属性值对齐 JSON.stringify 语义：视为不存在（Lexical 对省略可选字段的
+    // JSON 重序列化时会产出 detail: undefined 这类键，不能因此拒绝整份文档）。
+    if (child === undefined) continue;
+    validateJson(child, ancestors, depth + 1);
+  }
   ancestors.delete(value);
 }
 

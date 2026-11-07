@@ -323,17 +323,26 @@ test('B19: the executable host deduplicates admitted IDs and refuses a changed p
 });
 
 // 有序文档形状：正文与附件节点按文档顺序交织（空文本节点不是内容，不参与断言）。
+// 整篇文档读取：各段落的行内序列按「||」连接——单段落文档的断言字符串与只读首段时一致。
 const orderedOf = (page, index = 0) => page.evaluate((index) => {
   const records = index === null
     ? [window.composerTest.engine.getSnapshot().state.draft.snapshot]
     : [window.composerTest.engine.getSnapshot().state.submissions[index]?.snapshot].filter(Boolean);
-  return records.map((snapshot) => snapshot.document.value.root.children[0].children
-    .filter((node) => node.type !== 'text' || node.text)
-    .map((node) => node.type).join('|'));
+  return records.map((snapshot) => snapshot.document.value.root.children
+    .map((paragraph) => paragraph.children
+      .filter((node) => node.type !== 'text' || node.text)
+      .map((node) => node.type).join('|'))
+    .join('||'));
 }, index);
-const attachmentNodeIdOf = (page) => page.evaluate(() => {
-  const children = window.composerTest.engine.getSnapshot().state.draft.snapshot.document.value.root.children[0].children;
-  return children.find((node) => node.type === 'composer-attachment')?.nodeId;
+// 全部附件节点的身份（文档顺序，跨所有段落）：Node/AssetId 随移动与重排保持不变。
+const attachmentNodesOf = (page) => page.evaluate(() => {
+  const nodes = [];
+  for (const paragraph of window.composerTest.engine.getSnapshot().state.draft.snapshot.document.value.root.children) {
+    for (const node of paragraph.children) {
+      if (node.type === 'composer-attachment') nodes.push({ nodeId: node.nodeId, assetId: node.assetId });
+    }
+  }
+  return nodes;
 });
 
 test('B20: an attachment node keeps its place between words across reload, and double submit never duplicates it', async (t) => {
@@ -350,12 +359,12 @@ test('B20: an attachment node keeps its place between words across reload, and d
   });
   assert.deepEqual(await orderedOf(page, null), ['text|composer-attachment|text']);
   assert.equal(await page.locator('[data-testid=editor] .attachment').count(), 1);
-  const nodeId = await attachmentNodeIdOf(page);
+  const nodes = await attachmentNodesOf(page);
   // 刷新后草稿从 IndexedDB 恢复：有序内容与 NodeId 原样回来。
   await page.reload(); await page.waitForFunction(() => Boolean(window.composerTest));
   await page.locator('[data-testid=editor] .attachment').waitFor();
   assert.deepEqual(await orderedOf(page, null), ['text|composer-attachment|text']);
-  assert.equal(await attachmentNodeIdOf(page), nodeId);
+  assert.deepEqual(await attachmentNodesOf(page), nodes);
   // 暂扣回执时提交；再按一次 Enter 不得产生第二条消息或重复附件。
   await page.getByTestId('scenario').selectOption('hold');
   await editorOf(page).press('Enter'); await held(page);
@@ -567,7 +576,7 @@ test('B26: document drop shows the overlay, drop adds card and node, and no stuc
 });
 
 test('B27: policy rejection warns with names and reasons; accepted siblings are still added', async (t) => {
-  const { page } = await openPage(t, { editor: 'rich' });
+  const { page, scope } = await openPage(t, { editor: 'rich' });
   await editorOf(page).click();
   // 演示策略：单文件 2 MiB 上限。3 MiB 的文件按单文件大小只拒绝自己；同批正常文件照常进入。
   await pasteWith(page, [
@@ -590,4 +599,134 @@ test('B27: policy rejection warns with names and reasons; accepted siblings are 
   assert.equal(await page.locator('[data-testid=intake-warning]').count(), 0);
   await page.getByTestId('scenario').selectOption('normal');
   await editorOf(page).press('Enter'); await waitStatus(page, 'accepted');
+});
+
+// 步骤 5（正文附件移动）的共同开场：B20 式真实插入（A|B 之间）得到第一个附件节点，
+// 再经真实同步路径（engine.edit → validateSnapshot → composer-sync 整体替换，B15 同款）
+// 补出第二个真实段落与第二个附件。打字造不出真实段落：Enter 会提交，Shift+Enter 只是
+// 段内 LineBreakNode。「移动到末位」需要跨段落目标，所以文档必须有两个真实段落。
+const ORIGINAL_ORDER = 'text|composer-attachment|text||text|composer-attachment';
+// 移动后第一段剩 A、B 两个相邻 TextNode：Lexical 在 update 收尾的规范化会把同格式
+// 相邻文本节点合并成一个「AB」，所以期望是单个 text，而不是「text|text」。
+const MOVED_ORDER = 'text||text|composer-attachment|composer-attachment';
+const setupTwoParagraphAttachments = async (page, firstName, secondName) => {
+  await editorOf(page).click();
+  await page.keyboard.type('AB');
+  await editorOf(page).press('ArrowLeft');
+  await page.getByTestId('files').setInputFiles({ name: firstName, mimeType: 'image/png', buffer: Buffer.from(`${firstName}-bytes`) });
+  await page.waitForFunction(() => {
+    const view = window.composerTest.engine.getSnapshot();
+    return !view.dirty && view.state.draft.snapshot.attachments.length === 1
+      && (view.state.draft.snapshot.document?.value?.root?.children?.[0]?.children ?? [])
+        .some((node) => node.type === 'composer-attachment');
+  });
+  const ids = await page.evaluate(async ({ firstName, secondName }) => {
+    const engine = window.composerTest.engine;
+    const snapshot = structuredClone(engine.getSnapshot().state.draft.snapshot);
+    const firstNode = snapshot.document.value.root.children[0].children.find((node) => node.type === 'composer-attachment');
+    const secondAsset = { id: crypto.randomUUID(), name: secondName, mediaType: 'text/plain', data: new Blob([`${secondName}-bytes`]) };
+    const secondNodeId = crypto.randomUUID();
+    snapshot.attachments.push(secondAsset);
+    snapshot.document.value.root.children.push({
+      type: 'paragraph', version: 1, direction: null, format: '', indent: 0,
+      children: [
+        { detail: 0, format: 0, mode: 'normal', style: '', text: 'CD', type: 'text', version: 1 },
+        { type: 'composer-attachment', version: 1, nodeId: secondNodeId, assetId: secondAsset.id },
+      ],
+    });
+    await engine.edit(snapshot);
+    return { movedNodeId: firstNode.nodeId, movedAssetId: firstNode.assetId, tailNodeId: secondNodeId, tailAssetId: secondAsset.id };
+  }, { firstName, secondName });
+  // 等编辑器本体也完成 composer-sync 整体替换：后续 moveAttachmentNode 读的是编辑器文档，
+  // 不能在引擎已更新、编辑器未同步的窗口里开跑（此前这段写在 return 之后，从未执行）。
+  await page.waitForFunction(() => document.querySelectorAll('[data-testid=editor] .composer-paragraph').length === 2
+    && document.querySelectorAll('[data-testid=editor] .attachment').length === 2);
+  return ids;
+};
+// 草稿文档顺序（整篇）达到期望且已落盘。
+const draftOrderIs = (page, order) => page.waitForFunction((order) => {
+  const view = window.composerTest.engine.getSnapshot();
+  if (view.dirty) return false;
+  const document = view.state.draft.snapshot.document;
+  if (!document) return false;
+  return document.value.root.children
+    .map((paragraph) => paragraph.children
+      .filter((node) => node.type !== 'text' || node.text)
+      .map((node) => node.type).join('|'))
+    .join('||') === order;
+}, order);
+
+test('B28: moveAttachmentNode repositions an attachment across paragraphs in one undo step; payload keeps the order', async (t) => {
+  const { page, scope } = await openPage(t, { editor: 'rich' });
+  const ids = await setupTwoParagraphAttachments(page, '卡片.png', '尾件.txt');
+  const originalNodes = [
+    { nodeId: ids.movedNodeId, assetId: ids.movedAssetId },
+    { nodeId: ids.tailNodeId, assetId: ids.tailAssetId },
+  ];
+  await draftOrderIs(page, ORIGINAL_ORDER);
+  assert.deepEqual(await attachmentNodesOf(page), originalNodes);
+  // 编程路径（window.composerTest.moveAttachment → 注册的 mover → moveAttachmentNode）：
+  // 唯一移动对象移到附件序列第 1 位（末位）——跨段落插到第二个段落的最后一个附件之后。
+  await page.evaluate(({ assetId }) => window.composerTest.moveAttachment(assetId, 1), { assetId: ids.movedAssetId });
+  await draftOrderIs(page, MOVED_ORDER);
+  // 节点身份原样存活；attachments 列表（rail 顺序）不动——移动只改文档顺序。
+  const nodesAfterMove = [
+    { nodeId: ids.tailNodeId, assetId: ids.tailAssetId },
+    { nodeId: ids.movedNodeId, assetId: ids.movedAssetId },
+  ];
+  assert.deepEqual(await attachmentNodesOf(page), nodesAfterMove);
+  assert.deepEqual(await page.evaluate(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.attachments.map((item) => item.name)), ['卡片.png', '尾件.txt']);
+  // 一步 Undo：整步移动一次撤回（若移动拆成多次 update，此处会是中间态而非原序）。
+  await editorOf(page).press(process.platform === 'darwin' ? 'Meta+z' : 'Control+z');
+  await draftOrderIs(page, ORIGINAL_ORDER);
+  assert.deepEqual(await attachmentNodesOf(page), originalNodes);
+  // rail「后移」按钮走同一条注册的 mover：目标下标由文档顺序换算（0 → 1）。
+  await page.getByRole('button', { name: '后移 卡片.png' }).click();
+  await draftOrderIs(page, MOVED_ORDER);
+  assert.deepEqual(await attachmentNodesOf(page), nodesAfterMove);
+  // 暂扣回执提交：送达载荷保留移动后的整篇顺序与节点身份；附件列表顺序不变、字节齐全。
+  await page.getByTestId('scenario').selectOption('hold');
+  await editorOf(page).press('Enter'); await held(page);
+  await page.getByTestId('release').click(); await waitStatus(page, 'accepted');
+  const records = await messages(page, scope);
+  assert.equal(records.length, 1);
+  const sent = records[0].snapshot;
+  assert.deepEqual(await orderedOf(page, 0), [MOVED_ORDER]);
+  const sentNodes = await page.evaluate(() => {
+    const nodes = [];
+    for (const paragraph of window.composerTest.engine.getSnapshot().state.submissions[0].snapshot.document.value.root.children) {
+      for (const node of paragraph.children) {
+        if (node.type === 'composer-attachment') nodes.push({ nodeId: node.nodeId, assetId: node.assetId });
+      }
+    }
+    return nodes;
+  });
+  assert.deepEqual(sentNodes, nodesAfterMove);
+  assert.deepEqual(sent.attachments.map((item) => item.name), ['卡片.png', '尾件.txt']);
+  assert.equal(Buffer.from(sent.attachments[0].bytes, 'base64').toString(), '卡片.png-bytes');
+  assert.equal(Buffer.from(sent.attachments[1].bytes, 'base64').toString(), '尾件.txt-bytes');
+});
+
+test('B29: Ctrl/Cmd+Shift+Arrow moves the attachment the caret sits next to; one undo step restores', async (t) => {
+  const { page } = await openPage(t, { editor: 'rich' });
+  const ids = await setupTwoParagraphAttachments(page, '中卡.png', '尾行.txt');
+  await draftOrderIs(page, ORIGINAL_ORDER);
+  const originalNodes = await attachmentNodesOf(page);
+  // 光标放到第一个附件节点紧邻处：点击第一段（落点在卡片附近，DOM 光标停在附件紧前或
+  // 紧后的元素锚点），Home + 一次 → 后光标紧邻附件节点——$adjacentAttachmentOf 对紧前
+  // （offset-1 处）与紧后（offset 处）都能解析到同一个节点，落点差异不影响移动目标。
+  await page.locator('[data-testid=editor] .composer-paragraph').first().click();
+  await page.keyboard.press('Home');
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+Shift+ArrowRight' : 'Control+Shift+ArrowRight');
+  await draftOrderIs(page, MOVED_ORDER);
+  // 节点身份原样存活。
+  assert.deepEqual(await attachmentNodesOf(page), [
+    { nodeId: ids.tailNodeId, assetId: ids.tailAssetId },
+    { nodeId: ids.movedNodeId, assetId: ids.movedAssetId },
+  ]);
+  // 一步 Undo：整步移动一次撤回，文档顺序与节点身份都回来。
+  await editorOf(page).press(process.platform === 'darwin' ? 'Meta+z' : 'Control+z');
+  await draftOrderIs(page, ORIGINAL_ORDER);
+  assert.deepEqual(await attachmentNodesOf(page), originalNodes);
 });

@@ -7,7 +7,8 @@ import { HistoryPlugin } from "@lexical/react/LexicalHistoryPlugin";
 import { OnChangePlugin } from "@lexical/react/LexicalOnChangePlugin";
 import { LexicalErrorBoundary } from "@lexical/react/LexicalErrorBoundary";
 import {
-  $createParagraphNode, $createRangeSelection, $createTextNode, $getRoot, $getSelection, $isElementNode, $isRangeSelection,
+  $createParagraphNode, $createRangeSelection, $createTextNode, $getRoot, $getSelection, $getNearestNodeFromDOMNode,
+  $isElementNode, $isRangeSelection,
   $isTextNode, $setSelection, DecoratorNode, TextNode, KEY_ENTER_COMMAND, KEY_ARROW_UP_COMMAND, KEY_ARROW_DOWN_COMMAND,
   KEY_ESCAPE_COMMAND, PASTE_COMMAND, COMMAND_PRIORITY_HIGH, CLEAR_HISTORY_COMMAND, HISTORIC_TAG,
   type SerializedTextNode, type SerializedLexicalNode, type LexicalNode, type RangeSelection, type ElementNode,
@@ -16,6 +17,7 @@ import {
 import type { EditorProps, IntakeFile } from "./ChatComposer.tsx";
 import type { AssetId, JsonValue, NodeId } from "./types.ts";
 import { copy, hasContent, isEmptyDraft, newNodeId } from "./snapshots.ts";
+import { computeMoveSpan } from "./reorder.ts";
 import { splitClipboard } from "./intake.ts";
 import { ImeTracker, decideEnter } from "./key-decision.ts";
 import { CompletionSession, detectTrigger, type AcceptedPick } from "./completion.ts";
@@ -109,6 +111,93 @@ export function insertAttachmentNode(
     let paragraph = root.getLastChild();
     if (!paragraph) { paragraph = $createParagraphNode(); root.append(paragraph); }
     (paragraph as LexicalNode & { append(...nodes: LexicalNode[]): unknown }).append(node);
+  });
+}
+
+/** 按文档顺序枚举全部附件节点（深度优先，与序列化 JSON 的遍历顺序一致）。 */
+function $collectAttachmentNodes(): ComposerAttachmentNode[] {
+  const found: ComposerAttachmentNode[] = [];
+  const visit = (element: ElementNode): void => {
+    for (const child of element.getChildren()) {
+      if (child instanceof ComposerAttachmentNode) found.push(child);
+      else if ($isElementNode(child)) visit(child);
+    }
+  };
+  visit($getRoot());
+  return found;
+}
+
+/**
+ * 光标紧邻的附件节点（键盘移动的目标），以 DOM 选区为事实源——方向键移动光标是浏览器
+ * 原生行为，Lexical 的内部选区在 composer-sync setEditorState 之后可能停留在文档起点且
+ * 不随原生移动回同步（实测），不能拿内部选区当光标位置。解析规则：
+ * 元素容器按子节点序号（offset-1 处的附件紧贴光标之前、offset 处紧贴之后）；文本容器只在
+ * 光标位于文本端点时按该节点的前/后兄弟解析，在文本中间则无紧邻附件。
+ * 两个附件紧贴光标两侧时按移动方向取：向右移取光标前的那个，向左移取光标后的那个；
+ * 只有一个紧邻附件时无论方向都取它。必须在 editor.read() 内调用。
+ */
+function $domAdjacentAttachment(rootElement: HTMLElement, direction: 1 | -1): ComposerAttachmentNode | null {
+  const domSelection = rootElement.ownerDocument.getSelection();
+  if (domSelection === null || domSelection.rangeCount === 0) return null;
+  const range = domSelection.getRangeAt(0);
+  if (!rootElement.contains(range.startContainer)) return null;
+  const container = range.startContainer;
+  const offset = range.startOffset;
+  if (container.nodeType === container.TEXT_NODE) {
+    const textNode = $getNearestNodeFromDOMNode(container);
+    if (textNode === null || !$isTextNode(textNode)) return null;
+    if (offset !== 0 && offset !== textNode.getTextContentSize()) return null;
+    const sibling = offset === 0 ? textNode.getPreviousSibling() : textNode.getNextSibling();
+    return sibling instanceof ComposerAttachmentNode ? sibling : null;
+  }
+  if (container.nodeType !== container.ELEMENT_NODE) return null;
+  const domChildren = container.childNodes;
+  const beforeDom = offset > 0 ? domChildren[offset - 1] : null;
+  const afterDom = offset < domChildren.length ? domChildren[offset] : null;
+  const beforeNode = beforeDom === null ? null : $getNearestNodeFromDOMNode(beforeDom);
+  const afterNode = afterDom === null ? null : $getNearestNodeFromDOMNode(afterDom);
+  const beforeCaret = beforeNode instanceof ComposerAttachmentNode ? beforeNode : null;
+  const afterCaret = afterNode instanceof ComposerAttachmentNode ? afterNode : null;
+  return direction === 1 ? beforeCaret ?? afterCaret : afterCaret ?? beforeCaret;
+}
+
+/**
+ * 把 assetId 对应的附件节点移动到「整篇文档附件节点序列」的第 targetIndex 位（0 起，
+ * 语义见 reorder.ts）：按文档顺序枚举全部 composer-attachment 节点，目标越界钳制到
+ * [0, 数量-1]，已在目标位时无操作。插入位置：摘除后其余附件的第 targetIndex 个之前；
+ * 目标是末位时插在最后一个其余附件之后；没有其余附件时追加到文档最后一个段落。
+ * 跨段落移动天然支持——锚点附件在哪个段落，节点就插到哪个段落。
+ * 一次 editor.update = 一步 Undo；节点实例原样摘除再插回，Lexical key 与 NodeId/AssetId
+ * 不变，React 不重挂载，rail 的 object-URL 不重建。引擎不参与移动（不变量）：移动只改
+ * 文档顺序，outbox 与 attachments 列表一概不动，新顺序经 onChange 正常回写草稿。
+ */
+export function moveAttachmentNode(editor: LexicalEditorInstance, assetId: AssetId, targetIndex: number): void {
+  editor.update(() => {
+    const nodes = $collectAttachmentNodes();
+    const span = computeMoveSpan(
+      nodes.map((node) => ({ nodeId: node.__nodeId, assetId: node.__assetId })),
+      assetId, targetIndex,
+    );
+    if (!span) return;
+
+    const node = nodes[span.removeFrom];
+    const remaining = nodes.filter((_, index) => index !== span.removeFrom);
+    node.remove();
+    if (span.insertAt < remaining.length) {
+      remaining[span.insertAt].insertBefore(node);
+    } else if (remaining.length > 0) {
+      remaining[remaining.length - 1].insertAfter(node);
+    } else {
+      const root = $getRoot();
+      const last = root.getLastChild();
+      if ($isElementNode(last)) {
+        last.append(node);
+      } else {
+        const paragraph = $createParagraphNode();
+        root.append(paragraph);
+        paragraph.append(node);
+      }
+    }
   });
 }
 
@@ -211,7 +300,7 @@ interface MenuMirror {
   options: { key: string; label: string }[];
 }
 
-function Integration({ engine, registerAttachmentInserter, completionProvider, intake }: EditorProps) {
+function Integration({ engine, registerAttachmentInserter, registerAttachmentMover, completionProvider, intake }: EditorProps) {
   const [editor] = useLexicalComposerContext();
   const view = useComposerSubmission(engine);
   const draft = view.state.draft;
@@ -224,6 +313,11 @@ function Integration({ engine, registerAttachmentInserter, completionProvider, i
   const completionRef = useRef<CompletionSession | null>(null);
   if (!completionRef.current) completionRef.current = new CompletionSession();
   const providerRef = useRef<EditorProps["completionProvider"]>(completionProvider);
+  // 本地编辑的在途握手：编辑器发出的文档 JSON + 发起时的引擎版本。引擎发布到超过
+  // 发起版本的任何状态（含在途编辑自身的回显）即握手完成。握手未完成前禁止
+  // composer-sync 用旧草稿重置编辑器——否则「附件条目先落、节点编辑在途」的中间
+  // 渲染会把刚插入的节点吞掉（文件添加两步流程的真实竞争）。
+  const inFlightRef = useRef<{ json: string; dispatchedRevision: number } | null>(null);
   // 文本版本（只随正文文本变化递增）与最近一次检测到的文本；光标纯移动不推进版本。
   const docRevRef = useRef(0);
   const menuTextRef = useRef<string | null>(null);
@@ -243,6 +337,17 @@ function Integration({ engine, registerAttachmentInserter, completionProvider, i
       options: session.candidates.map((candidate, index) => ({ key: `${index}:${candidate.insertText}`, label: candidate.label })),
     });
   }, []);
+
+  // 在途握手清账：引擎发布到超过发起版本的任何状态都算窗口结束（编辑自身被拒绝时，
+  // 下一次成功的发布同样解锁同步）。同步效果的顶部守卫消费这个标记。
+  useEffect(() => engine.subscribe(() => {
+    const inFlight = inFlightRef.current;
+    if (inFlight === null) return;
+    const draft = engine.getSnapshot().state.draft;
+    if (draft.revision > inFlight.dispatchedRevision || JSON.stringify(draft.snapshot.document?.value) === inFlight.json) {
+      inFlightRef.current = null;
+    }
+  }), [engine]);
 
   useEffect(() => {
     const ime = imeRef.current!;
@@ -358,6 +463,48 @@ function Integration({ engine, registerAttachmentInserter, completionProvider, i
     return () => registerAttachmentInserter?.(null);
   }, [editor, registerAttachmentInserter]);
 
+  // 移动入口（rail 卡片「前移/后移」的落点）：与插入入口同款注册模式。引擎不参与移动，
+  // 这里只是把目标下标转发给 moveAttachmentNode（一次 editor.update = 一步 Undo）。
+  useEffect(() => {
+    registerAttachmentMover?.((assetId, targetAttachmentIndex) => moveAttachmentNode(editor, assetId, targetAttachmentIndex));
+    return () => registerAttachmentMover?.(null);
+  }, [editor, registerAttachmentMover]);
+
+  // 键盘兜底：光标紧邻附件节点时，Ctrl/Cmd+Shift+→/← 把该节点移过后一个/前一个附件节点
+  // （同方向没有更多附件时由 clamp 钳到端点 = 无操作）。与菜单（↑/↓/Esc）、Enter 仲裁、
+  // 粘贴键位不重叠，互不影响；组合中的方向键属于输入法，只读窗口不移动。
+  // 注意：不能走 Lexical 的 KEY_ARROW_*_COMMAND——Lexical 的 isMoveForward 掩码未声明
+  // ctrlKey 时按「必须为 false」匹配（matchModifier: undefined || false），Ctrl/Cmd+Shift+方向键
+  // 既不匹配 isMoveForward 也不匹配 isMoveToEnd，命令根本不会派发；所以同 DSH 的
+  // registerComposerKeymap 一样，直接在编辑器根元素挂原生 keydown。
+  // 目标解析以 DOM 选区为事实源（$domAdjacentAttachment），不读 Lexical 内部选区。
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent): void => {
+      const direction = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+      if (direction === 0 || !event.shiftKey || !(event.ctrlKey || event.metaKey) || event.altKey) return;
+      if (imeRef.current!.isComposing(Date.now()).composing || !editor.isEditable()) return;
+      const root = editor.getRootElement();
+      if (!root) return;
+      // 用 editor.read（而非 editorState.read）：$getNearestNodeFromDOMNode 需要活动编辑器
+      // 才能查 DOM→节点映射，editorState.read 只设状态不设编辑器，会抛 "no active editor"。
+      const target = editor.read(() => {
+        const adjacent = $domAdjacentAttachment(root, direction);
+        if (!adjacent) return null;
+        const currentIndex = $collectAttachmentNodes().findIndex((node) => node.getKey() === adjacent.getKey());
+        return currentIndex < 0 ? null : { assetId: adjacent.__assetId, targetIndex: currentIndex + direction };
+      });
+      if (!target) return;
+      event.preventDefault();
+      moveAttachmentNode(editor, target.assetId, target.targetIndex);
+    };
+    // 根元素经 registerRootListener 挂/摘监听：本 effect 可能先于 Lexical 注册根元素执行，
+    // getRootElement() 当时为 null 会让监听器永远装不上；根元素替换时也要跟着换。
+    return editor.registerRootListener((root, previousRoot) => {
+      if (previousRoot) previousRoot.removeEventListener("keydown", onKeyDown);
+      if (root) root.addEventListener("keydown", onKeyDown);
+    });
+  }, [editor]);
+
   // 粘贴（DSH PASTE_COMMAND 同款）：在事件处理器内同步读 clipboardData——await 之后剪贴板即失效。
   // 路由用 splitClipboard 判定：无文件时返回 false 交给 Lexical 默认粘贴（纯文本路径不变）；
   // 有文件时 preventDefault 并统一准入（候选菜单开着也一样——粘贴不经过菜单会话，
@@ -394,6 +541,8 @@ function Integration({ engine, registerAttachmentInserter, completionProvider, i
   }, [editor, view.admitting, view.closed]);
 
   useLayoutEffect(() => {
+    // 在途握手未完成：引擎里还是本地编辑发生前的旧状态，不能用旧草稿重置编辑器。
+    if (inFlightRef.current !== null) return;
     const document = draft.snapshot.document;
     if (document?.format === "lexical") {
       const json = JSON.stringify(document.value);
@@ -470,6 +619,8 @@ function Integration({ engine, registerAttachmentInserter, completionProvider, i
     });
     const previous = current.state.draft.snapshot;
     if (previous.text === text && JSON.stringify(previous.document?.value) === JSON.stringify(value)) return;
+    // 在途握手登记：本地发出的文档在引擎回显（或版本推进）前，composer-sync 不得用旧草稿重置编辑器。
+    inFlightRef.current = { json: JSON.stringify(value), dispatchedRevision: current.state.draft.revision };
     void engine.edit({
       ...copy(previous), text, references: [...copy(previous.references.filter((reference) => reference.kind !== "mention")), ...references],
       document: { format: "lexical", version: 1, value: value as unknown as JsonValue },
@@ -518,13 +669,13 @@ function Integration({ engine, registerAttachmentInserter, completionProvider, i
 }
 
 /** Actual Lexical serialization, token nodes and restoration; no string-only rich-text substitute. */
-export function LexicalEditor({ engine, placeholder, registerAttachmentInserter, completionProvider, intake }: EditorProps) {
+export function LexicalEditor({ engine, placeholder, registerAttachmentInserter, registerAttachmentMover, completionProvider, intake }: EditorProps) {
   return <LexicalComposer initialConfig={{
     namespace: "ReliableComposer", nodes: [ComposerMentionNode, ComposerAttachmentNode],
     theme: { paragraph: "composer-paragraph" }, onError(error) { throw error; },
   }}>
     {/* Integration 排在编辑器之前：菜单 overlay 因此渲染在输入框上方（composer 卡片内）。 */}
-    <Integration engine={engine} registerAttachmentInserter={registerAttachmentInserter} completionProvider={completionProvider} intake={intake} />
+    <Integration engine={engine} registerAttachmentInserter={registerAttachmentInserter} registerAttachmentMover={registerAttachmentMover} completionProvider={completionProvider} intake={intake} />
     <div className="rich-editor">
       <PlainTextPlugin
         contentEditable={<ContentEditable data-testid="editor" aria-label="消息" />}

@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState, type ComponentType } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import type { ComposerEngine } from "./core.ts";
-import { copy, documentWithoutAttachment, hasContent, isEmptyDraft, newAssetId } from "./snapshots.ts";
+import { copy, documentAttachmentNodes, documentWithoutAttachment, hasContent, isEmptyDraft, newAssetId } from "./snapshots.ts";
 import { ImeTracker, decideEnter } from "./key-decision.ts";
 import { useComposerSubmission } from "./useComposerSubmission.ts";
 import type { Candidate, TriggerKind } from "./completion.ts";
@@ -25,6 +25,12 @@ export interface EditorProps {
    * 纯文本编辑器不注册：其文档只是纯文本，附件保持 rail-only，不进有序文档（见 ChatComposer）。
    */
   registerAttachmentInserter?: (insert: ((assetId: AssetId) => void) | null) => void;
+  /**
+   * 富文本编辑器挂载后注册「把附件节点移到附件序列第 targetAttachmentIndex 位」的入口
+   * （目标下标语义见 reorder.ts），卸载时以 null 注销。移动只改文档顺序，引擎不参与；
+   * 纯文本编辑器不注册：无有序文档即无移动（rail-only 不对称，见 README）。
+   */
+  registerAttachmentMover?: (move: ((assetId: AssetId, targetAttachmentIndex: number) => void) | null) => void;
   /**
    * 候选菜单来源。缺省时富文本侧也不开菜单。旧查询的迟到结果由组件内的代次守卫拒绝；
    * 纯文本编辑器不使用（菜单暂缓，与 rail-only 附件同款的不对称，见 README）。
@@ -118,6 +124,23 @@ export function ChatComposer({ engine, Editor = TextareaEditor, placeholder = "�
   const registerAttachmentInserter = useCallback((insert: ((assetId: AssetId) => void) | null) => {
     inserterRef.current = insert;
   }, []);
+  const moverRef = useRef<((assetId: AssetId, targetAttachmentIndex: number) => void) | null>(null);
+  const registerAttachmentMover = useCallback((move: ((assetId: AssetId, targetAttachmentIndex: number) => void) | null) => {
+    moverRef.current = move;
+  }, []);
+  // rail 卡片「前移/后移」的入口：目标下标由 AttachmentCards 按文档顺序换算，这里只转发。
+  // 不变量：移动不经过引擎——只改有序文档里的节点顺序，outbox 与 attachments 列表
+  // （rail 的顺序与 object-URL 生命周期）一概不动；新顺序经编辑器 onChange 正常回写草稿。
+  const onMoveAttachment = useCallback((assetId: AssetId, targetAttachmentIndex: number) => {
+    moverRef.current?.(assetId, targetAttachmentIndex);
+  }, []);
+  // 文档顺序里的附件 AssetId 序列（rail 移动按钮的换算依据）。纯文本模式没有有序文档
+  // → undefined，rail 不给移动按钮（rail-only 不对称）。身份来自引擎已校验的草稿快照。
+  const documentAttachmentOrder = useMemo<readonly AssetId[] | undefined>(() => {
+    const document = snapshot.document;
+    if (!document) return undefined;
+    return documentAttachmentNodes(document.value).map((node) => node.assetId as AssetId);
+  }, [snapshot.document]);
   const [intakeNotice, setIntakeNotice] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const canAcceptDrop = !view.admitting && !view.closed;
@@ -247,9 +270,13 @@ export function ChatComposer({ engine, Editor = TextareaEditor, placeholder = "�
   return <section className="chat-composer" aria-label="聊天输入框">
     <Editor
       engine={engine} placeholder={placeholder} registerAttachmentInserter={registerAttachmentInserter}
+      registerAttachmentMover={registerAttachmentMover}
       completionProvider={completionProvider} intake={runIntake}
     />
-    <AttachmentCards attachments={snapshot.attachments} disabled={view.admitting} onRemove={removeAttachment} />
+    <AttachmentCards
+      attachments={snapshot.attachments} disabled={view.admitting} onRemove={removeAttachment}
+      attachmentOrder={documentAttachmentOrder} onMoveAttachment={onMoveAttachment}
+    />
     <div className="composer-actions">
       <label>添加附件 <input data-testid="files" type="file" multiple disabled={view.admitting} onChange={(event) => {
         const files = Array.from(event.target.files ?? []);

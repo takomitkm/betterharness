@@ -5,11 +5,13 @@ import { formatBytes, type IntakePolicy } from "./intake.ts";
 
 // 附件呈现（对应 DSH ui-attachment 的 AttachmentRail / FileCard / DropOverlay / 预览）：
 //   - 图片缩略图：object-URL 预览，点击开灯箱；文件卡：类型占位符/扩展名首字母、名称、扩展名+大小、移除；
+//   - 「前移/后移」按钮：拖动的键盘/触屏替代（移动本体在编辑器侧，见 reorder.ts 与 moveAttachmentNode）；
 //   - 横向 rail：边缘翻页箭头按滚动几何 + ResizeObserver 重算；滚轮只横滚 rail
 //     （非 passive 监听、preventDefault、LINE/PAGE 增量归一、每格钳制、reduced-motion 降级）；
 //   - 新附件滚入视野；整个 rail 因草稿清空而卸载、又随附件重新挂载时保持起始位置（不跳到末尾）；
 //   - object-URL 纪律：每个视图（缩略图/灯箱）拥有自己的 URL，按 AssetId 创建、卸载/换资产即释放；
-//     被移除资产的晚到预览加载不会复活卡片（URL 已随卸载失效，卡片本身也从快照消失）。
+//     被移除资产的晚到预览加载不会复活卡片（URL 已随卸载失效，卡片本身也从快照消失）；
+//     草稿重排（移动）不改本列表、不重挂卡片，URL 因此零重建。
 // 本文件只做呈现：数据全部来自快照，无上传生命周期（字节在本地，发送载荷已携带；见 README）。
 
 /** 拖放遮罩的限额文案（演示与宿主共用；纯文本拼装，无策略时返回空串）。 */
@@ -64,19 +66,22 @@ function useAssetUrl(assetId: AssetId, data: Blob): string | null {
   return url;
 }
 
-function ImageThumb({ attachment, disabled, onRemove, onOpen }: {
-  attachment: Attachment; disabled: boolean; onRemove: () => void; onOpen: () => void;
+function ImageThumb({ attachment, disabled, moves, onRemove, onOpen }: {
+  attachment: Attachment; disabled: boolean; moves: AttachmentMoveControl | null; onRemove: () => void; onOpen: () => void;
 }) {
   const url = useAssetUrl(attachment.id, attachment.data);
   return <span className="attachment-image" data-testid="attachment-thumb" data-asset-id={attachment.id}>
     <button type="button" className="attachment-image-open" title="点击放大" aria-label={`查看 ${attachment.name}`} disabled={url === null} onClick={onOpen}>
       {url === null ? <span className="attachment-image-pending" aria-hidden="true">…</span> : <img src={url} alt={attachment.name} />}
     </button>
+    {moves && <AttachmentMoveButtons attachment={attachment} disabled={disabled} moves={moves} />}
     <button type="button" className="attachment-remove" disabled={disabled} aria-label={`移除 ${attachment.name}`} onClick={onRemove}>×</button>
   </span>;
 }
 
-function FileCardView({ attachment, disabled, onRemove }: { attachment: Attachment; disabled: boolean; onRemove: () => void }) {
+function FileCardView({ attachment, disabled, moves, onRemove }: {
+  attachment: Attachment; disabled: boolean; moves: AttachmentMoveControl | null; onRemove: () => void;
+}) {
   const extension = fileExtensionOf(attachment.name).toUpperCase().slice(0, 8);
   const meta = [extension, formatBytes(attachment.data.size)].filter((part) => part !== "").join(" · ");
   return <span className="attachment-file" data-testid="attachment-card" data-asset-id={attachment.id} title={attachment.name}>
@@ -84,8 +89,22 @@ function FileCardView({ attachment, disabled, onRemove }: { attachment: Attachme
     <span className="attachment-file-body" aria-label={`待发送文件 ${attachment.name}`}>
       <span className="attachment-file-name">{attachment.name}</span>
       <span className="attachment-file-meta">{meta || formatBytes(attachment.data.size)}</span>
+      {moves && <AttachmentMoveButtons attachment={attachment} disabled={disabled} moves={moves} />}
     </span>
     <button type="button" className="attachment-remove" disabled={disabled} aria-label={`移除 ${attachment.name}`} onClick={onRemove}>×</button>
+  </span>;
+}
+
+/** 「前移/后移」按钮（拖动的键盘/触屏替代，移动本体在编辑器侧 moveAttachmentNode）。 */
+function AttachmentMoveButtons({ attachment, disabled, moves }: {
+  attachment: Attachment; disabled: boolean; moves: AttachmentMoveControl;
+}) {
+  const fire = (target: number | null): void => {
+    if (target !== null) moves.fire(target);
+  };
+  return <span className="attachment-moves">
+    <button type="button" className="attachment-move" disabled={disabled || moves.backward === null} aria-label={`前移 ${attachment.name}`} onClick={() => fire(moves.backward)}>前移</button>
+    <button type="button" className="attachment-move" disabled={disabled || moves.forward === null} aria-label={`后移 ${attachment.name}`} onClick={() => fire(moves.forward)}>后移</button>
   </span>;
 }
 
@@ -192,16 +211,35 @@ function AttachmentRail<T extends RailItem>({ items, renderItem }: { items: read
   </div>;
 }
 
+/** 单张卡片的移动能力：backward/forward 是目标附件下标（语义见 reorder.ts），
+ * null = 该方向不可移（已在端点 / 附件不在有序文档里 / 没有移动入口）。 */
+export interface AttachmentMoveControl {
+  backward: number | null;
+  forward: number | null;
+  fire: (targetAttachmentIndex: number) => void;
+}
+
 export interface AttachmentCardsProps {
   /** 草稿附件条目（快照事实来源）。 */
   attachments: readonly Attachment[];
-  /** 交接窗口（admitting）：移除按钮禁用，与其它编辑入口一致。 */
+  /** 交接窗口（admitting）：移除/移动按钮禁用，与其它编辑入口一致。 */
   disabled: boolean;
   onRemove: (id: AssetId) => void;
+  /**
+   * 有序文档里的附件 AssetId 序列（文档顺序，不是 attachments 列表顺序）。
+   * 缺省 = 没有有序文档（纯文本模式）：不提供移动——rail-only 不对称（见 README）。
+   */
+  attachmentOrder?: readonly AssetId[];
+  /** 移动入口（ChatComposer 转发给编辑器注册的 mover）；与 attachmentOrder 成对提供。 */
+  onMoveAttachment?: (assetId: AssetId, targetAttachmentIndex: number) => void;
 }
 
-/** 草稿附件的卡片呈现：图片缩略图 + 文件卡 + 灯箱，装在横向 rail 里。没有附件时不渲染。 */
-export function AttachmentCards({ attachments, disabled, onRemove }: AttachmentCardsProps) {
+/**
+ * 草稿附件的卡片呈现：图片缩略图 + 文件卡 + 灯箱，装在横向 rail 里。没有附件时不渲染。
+ * 不变量：卡片（与 object-URL）按 AssetId 键控，附件「移动」只改有序文档、不改本列表——
+ * 重排草稿时 rail 不重挂、预览 URL 不重建（useAssetUrl 只依赖 assetId）。
+ */
+export function AttachmentCards({ attachments, disabled, onRemove, attachmentOrder, onMoveAttachment }: AttachmentCardsProps) {
   // 灯箱以 AssetId 记忆：对应附件被移除时预览必须跟着关（DSH：图片消失时关闭它的预览）。
   const [previewId, setPreviewId] = useState<AssetId | null>(null);
   useEffect(() => {
@@ -210,12 +248,25 @@ export function AttachmentCards({ attachments, disabled, onRemove }: AttachmentC
   const preview = previewId === null ? null : attachments.find((item) => item.id === previewId) ?? null;
   // hooks 必须在顶层先全部执行完，之后才允许按内容提前返回。
   if (attachments.length === 0) return null;
+  const moveControlOf = (id: AssetId): AttachmentMoveControl | null => {
+    if (!onMoveAttachment || !attachmentOrder) return null; // 无移动入口（纯文本模式）：不渲染按钮。
+    const current = attachmentOrder.indexOf(id);
+    if (current < 0) {
+      // rail-only 附件（尚未插入文档）：按钮可见但不可移，功能存在与否一目了然。
+      return { backward: null, forward: null, fire: () => {} };
+    }
+    return {
+      backward: current > 0 ? current - 1 : null,
+      forward: current < attachmentOrder.length - 1 ? current + 1 : null,
+      fire: (target) => onMoveAttachment(id, target),
+    };
+  };
   const items = attachments.map((attachment) => ({ id: attachment.id, attachment }));
   return <>
     <AttachmentRail items={items} renderItem={({ attachment }) => (
       isImageType(attachment.mediaType)
-        ? <ImageThumb attachment={attachment} disabled={disabled} onRemove={() => onRemove(attachment.id)} onOpen={() => setPreviewId(attachment.id)} />
-        : <FileCardView attachment={attachment} disabled={disabled} onRemove={() => onRemove(attachment.id)} />
+        ? <ImageThumb attachment={attachment} disabled={disabled} moves={moveControlOf(attachment.id)} onRemove={() => onRemove(attachment.id)} onOpen={() => setPreviewId(attachment.id)} />
+        : <FileCardView attachment={attachment} disabled={disabled} moves={moveControlOf(attachment.id)} onRemove={() => onRemove(attachment.id)} />
     )} />
     {preview && <Lightbox attachment={preview} onClose={() => setPreviewId(null)} />}
   </>;
