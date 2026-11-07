@@ -41,6 +41,8 @@ queued ── 保存 sending 标记 ──► sending ──► accepted
 | `key-decision.ts` | Enter/IME 仲裁：注入时钟的纯函数裁决与组合状态跟踪，「是否继续处理」与「是否拦截浏览器」两条决策分开表达 |
 | `completion.ts` | 候选菜单纯状态机（零依赖）：@/slash 触发检测、查询代次守卫（纯化的 AbortController）、高亮与选择写回计算 |
 | `CandidateMenu.tsx` | 候选菜单列表框：aria-activedescendant、行 mousedown 保持编辑器选区、真实 mousemove 移动高亮、外部按下关闭 |
+| `intake.ts` | 文件准入纯模块（零依赖）：IntakePolicy/intakeFiles 整批与逐文件裁决、splitClipboard 粘贴路由判定、formatBytes |
+| `AttachmentCards.tsx` | 附件呈现：横向 rail（翻页箭头/滚轮横滚）、图片缩略图 + 灯箱、文件卡、全视口拖放遮罩；object-URL 生命周期归每个视图所有 |
 | `http-transport.ts` | 示例 HTTP 绑定：完整快照、幂等键、回执查询 |
 | `demo.tsx` / `demo.html` | 使用上述生产实现的交互演示，不另写一套状态机 |
 | `verify/` | 核心故障测试、真实浏览器测试、临时副本变异验证与演示服务 |
@@ -112,7 +114,7 @@ store.close();
 
 正文为空但有附件/引用仍可提交。IndexedDB 保存实际 Blob 字节，不保存会在刷新后失效的 `blob:` 地址。队列、重试、取回编辑使用同一完整快照。
 
-提交记录保留本地副本，直到用户明确移除已接纳、已拒绝或已取回的记录；`unknown`、`sending`、`queued` 不允许直接遗忘。移除一条记录不删除其他草稿仍持有的附件。当前组件不创建附件预览 object URL，因此没有依赖外部 URL 生命周期的隐藏所有权。
+提交记录保留本地副本，直到用户明确移除已接纳、已拒绝或已取回的记录；`unknown`、`sending`、`queued` 不允许直接遗忘。移除一条记录不删除其他草稿仍持有的附件。预览 object URL 只活在呈现层（AttachmentCards）：每个视图按 AssetId 拥有自己的 URL，卸载或移除即释放；持久层永远只见 Blob 字节，不保存也不依赖 URL。
 
 自定义编辑器使用 `createEditorAdapter(engine)`：`capture()` 取完整快照；`apply(snapshot, expectedDraft)` 只接受同一 generation/revision 的结果，避免异步附件准备或格式化覆盖后来的输入。
 
@@ -148,6 +150,21 @@ store.close();
 - **过期保护**：查询变更即换代次；旧查询的迟到结果按代次拒绝，pending 期间候选不可选、Enter 只确认菜单不发送。
 - **一次选择一次 Undo**：选择写回（@ → mention token 节点 + 补尾空格；/ → 命令回显文本 + 补尾空格）在同一个 editor.update 内完成，光标落在空格之后。
 - 键盘：Enter 确认高亮项（菜单裁决先于 repeat/submit）；↑/↓ 在就绪候选间循环移动；Esc 关闭且同一条目不立刻弹回；点击菜单与输入框之外关闭。组合（IME）中的按键一律先交给输入法，组合结束后的宽限窗口内同样不检测触发。
+
+## 统一文件准入与附件呈现（选择 / 粘贴 / 拖入）
+
+三个入口——文件选择器、富文本编辑器粘贴（`PASTE_COMMAND`）、文档级拖放——汇到同一个准入路径（`ChatComposer` 的 `runIntake` → `intake.ts` 的纯检查），策略由宿主通过 `intakePolicy` 提供（缺省不限制）：
+
+- **整批拒绝**（先于任何添加，DSH 同款）：`maxFiles`（按已有 + 新来数量）与 `maxBytesTotal`（按已有 + 新来字节）违规时整批拒绝，`reason` 为 `too_many` / `total_too_large`。
+- **逐文件拒绝**：`maxBytesPerFile` 违规（`file_too_large`）与类型不在 `allowedMediaTypes`（`unsupported_type`）只拒绝该文件，同批其余文件照常进入。取舍说明：DSH 的图片单文件大小违规也整批拒绝，但 DSH 对通用文件本就没有本地大小上限；推广到通用文件时这里选择不连坐同批文件。
+- **目录**：浏览器侧用 `webkitGetAsEntry().isDirectory` 识别（目录掉落的 File 与空文件无法区分，条目 API 是唯一来源），记录名称并按 `unsupported_type` 拒绝。
+- **粘贴路由**（DSH `PASTE_COMMAND` 同款）：在事件处理器内同步读 `clipboardData`（await 之后剪贴板即失效）；文件先准入，同剪贴板的 `text/plain` 原文在条目落盘后插入——一次粘贴两者并存，文件准入被拒也不吞文字。无文件的纯文本粘贴走编辑器默认路径。粘贴不经过候选菜单会话：菜单开着时文件照常准入，文本按普通输入处理并重新检测触发。
+- **拖放**（DSH `installDocumentDropEvents` 同款）：document 级 dragenter/over/leave/drop，`dragDepth` 计数防止子元素穿越闪烁；dragleave 到视口边缘或 window `dragend` 兜底重置；`dropEffect` 随可用性为 copy/none；全视口遮罩只做提示（portal + `pointer-events: none` + `role=status`），不截获指针。
+- **拒绝提示不阻塞发送**：最近一次准入的拒绝（名称 + 原因）以可关闭的警告列出，同批已接受的文件不受影响，发送门控仍只看内容是否非空。
+
+**呈现**（`AttachmentCards.tsx`）：横向 rail，图片缩略图（object-URL 预览，点击开灯箱，附件被移除时预览随关）与文件卡（类型占位符/扩展名首字母、名称、扩展名 + 大小、移除）；边缘翻页箭头按滚动几何 + `ResizeObserver` 重算；滚轮只横滚 rail（非 passive、LINE/PAGE 增量归一、每格钳制、reduced-motion 降级）；新附件滚入视野，rail 重新挂载保持起始位置。
+
+**范围与后续（宿主集成点）**：字节始终在本地，发送载荷直接携带它们，因此这里没有 DSH 的上传生命周期——`FileCard`/图片缩略图的 uploading/ready/error 状态、进度轨道、失败重试（可重试错误与明确拒绝分开）是留给真实宿主上传管线的集成点，本组件不伪造进度。粘贴文件入口目前只在富文本编辑器接线（textarea 的 paste-files 暂缓，与菜单 rail-only 同款不对称）；拖放在两种模式都可用（textarea 模式附件保持 rail-only，不进有序文档）。
 
 ## 本地运行与验证
 

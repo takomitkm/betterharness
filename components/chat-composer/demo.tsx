@@ -6,7 +6,15 @@ import { createComposer } from "./core.ts";
 import { IndexedDbComposerStore } from "./store.ts";
 import { createHttpTransport } from "./http-transport.ts";
 import { useComposerSubmission } from "./useComposerSubmission.ts";
+import type { IntakePolicy } from "./intake.ts";
 import type { ComposerStore } from "./types.ts";
+
+// 演示准入策略：真实可触发的上限（通用文件，不做图片白名单）——
+// 超 2 MiB 的文件按单文件大小逐文件拒绝（不连坐同批正常文件），第 7 个文件整批拒绝。
+const DEMO_INTAKE_POLICY: IntakePolicy = {
+  maxFiles: 6,
+  maxBytesPerFile: 2 * 1024 * 1024,
+};
 
 // 演示候选源：固定内存列表（@ 文件引用、/ 命令回显）。生产宿主在这里接真实的文件/命令检索。
 const DEMO_REFERENCES = [
@@ -98,6 +106,7 @@ function App() {
       engine={engine}
       Editor={editor === "rich" ? LexicalEditor : TextareaEditor}
       completionProvider={(kind, query) => (completionOverride ?? demoCompletionProvider)(kind, query)}
+      intakePolicy={DEMO_INTAKE_POLICY}
     />
     <section className="host-controls" aria-label="宿主事件演示">
       <button type="button" data-testid="end-turn" disabled={!view.state.activeTurn} onClick={() => {

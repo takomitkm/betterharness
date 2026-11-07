@@ -9,13 +9,14 @@ import { LexicalErrorBoundary } from "@lexical/react/LexicalErrorBoundary";
 import {
   $createParagraphNode, $createRangeSelection, $createTextNode, $getRoot, $getSelection, $isElementNode, $isRangeSelection,
   $isTextNode, $setSelection, DecoratorNode, TextNode, KEY_ENTER_COMMAND, KEY_ARROW_UP_COMMAND, KEY_ARROW_DOWN_COMMAND,
-  KEY_ESCAPE_COMMAND, COMMAND_PRIORITY_HIGH, CLEAR_HISTORY_COMMAND, HISTORIC_TAG,
+  KEY_ESCAPE_COMMAND, PASTE_COMMAND, COMMAND_PRIORITY_HIGH, CLEAR_HISTORY_COMMAND, HISTORIC_TAG,
   type SerializedTextNode, type SerializedLexicalNode, type LexicalNode, type RangeSelection, type ElementNode,
   type LexicalEditor as LexicalEditorInstance, type EditorState,
 } from "lexical";
-import type { EditorProps } from "./ChatComposer.tsx";
+import type { EditorProps, IntakeFile } from "./ChatComposer.tsx";
 import type { AssetId, JsonValue, NodeId } from "./types.ts";
 import { copy, hasContent, isEmptyDraft, newNodeId } from "./snapshots.ts";
+import { splitClipboard } from "./intake.ts";
 import { ImeTracker, decideEnter } from "./key-decision.ts";
 import { CompletionSession, detectTrigger, type AcceptedPick } from "./completion.ts";
 import { CandidateMenu } from "./CandidateMenu.tsx";
@@ -114,6 +115,14 @@ export function insertAttachmentNode(
 interface PlainSegment { node: TextNode; start: number; end: number; }
 interface PlainWalk { text: string; segments: PlainSegment[]; }
 
+/** 在当前选区插入 text/plain 原文（有文件伴随的粘贴用；DSH 消费纯文本而不是 HTML）。 */
+function insertPlainText(editor: LexicalEditorInstance, text: string): void {
+  editor.update(() => {
+    const selection = $getSelection();
+    if ($isRangeSelection(selection)) selection.insertText(text);
+  });
+}
+
 /**
  * 按文档顺序展开纯文本与各文本节点的偏移区间（mention token 也按其文本参与）。
  * 块级元素之间补一个「\n」分隔：触发检测只要求 (text, caret) 自洽且不跨块，无需与
@@ -202,7 +211,7 @@ interface MenuMirror {
   options: { key: string; label: string }[];
 }
 
-function Integration({ engine, registerAttachmentInserter, completionProvider }: EditorProps) {
+function Integration({ engine, registerAttachmentInserter, completionProvider, intake }: EditorProps) {
   const [editor] = useLexicalComposerContext();
   const view = useComposerSubmission(engine);
   const draft = view.state.draft;
@@ -349,6 +358,37 @@ function Integration({ engine, registerAttachmentInserter, completionProvider }:
     return () => registerAttachmentInserter?.(null);
   }, [editor, registerAttachmentInserter]);
 
+  // 粘贴（DSH PASTE_COMMAND 同款）：在事件处理器内同步读 clipboardData——await 之后剪贴板即失效。
+  // 路由用 splitClipboard 判定：无文件时返回 false 交给 Lexical 默认粘贴（纯文本路径不变）；
+  // 有文件时 preventDefault 并统一准入（候选菜单开着也一样——粘贴不经过菜单会话，
+  // 菜单随后按普通文本变化重新检测触发，与打字一致）。一次粘贴文件与文本可以并存：
+  // 文件先准入，text/plain 原文在条目落盘后由 after 插入（此时选区已随文件调用更新，
+  // 附件节点最终落在选区末端之后，与 DSH 的 after-the-selection-end 一致）；
+  // 文件准入被拒也不吞同剪贴板的文字（after 照常执行）。
+  useEffect(() => {
+    return editor.registerCommand(PASTE_COMMAND, (event) => {
+      // Lexical 的粘贴载荷可能是剪贴板事件，也可能是触发粘贴的键盘事件；
+      // 只有真剪贴板事件带 clipboardData，其余交给 Lexical 默认处理。
+      if (!(event instanceof ClipboardEvent) || !event.clipboardData) return false;
+      const dataTransfer = event.clipboardData;
+      const items = [...dataTransfer.items];
+      const split = splitClipboard(items);
+      if (!split.hasFiles) return false;
+      event.preventDefault();
+      const batch: IntakeFile[] = [];
+      for (const item of items) {
+        if (item.kind !== "file") continue;
+        const file = item.getAsFile();
+        if (!file) continue;
+        const entry = typeof item.webkitGetAsEntry === "function" ? item.webkitGetAsEntry() : null;
+        batch.push({ file, directory: entry?.isDirectory === true });
+      }
+      const text = split.hasText ? dataTransfer.getData("text/plain") : "";
+      intake?.(batch, text ? () => insertPlainText(editor, text) : undefined);
+      return true;
+    }, COMMAND_PRIORITY_HIGH);
+  }, [editor, intake]);
+
   useLayoutEffect(() => {
     editor.setEditable(!view.admitting && !view.closed);
   }, [editor, view.admitting, view.closed]);
@@ -478,13 +518,13 @@ function Integration({ engine, registerAttachmentInserter, completionProvider }:
 }
 
 /** Actual Lexical serialization, token nodes and restoration; no string-only rich-text substitute. */
-export function LexicalEditor({ engine, placeholder, registerAttachmentInserter, completionProvider }: EditorProps) {
+export function LexicalEditor({ engine, placeholder, registerAttachmentInserter, completionProvider, intake }: EditorProps) {
   return <LexicalComposer initialConfig={{
     namespace: "ReliableComposer", nodes: [ComposerMentionNode, ComposerAttachmentNode],
     theme: { paragraph: "composer-paragraph" }, onError(error) { throw error; },
   }}>
     {/* Integration 排在编辑器之前：菜单 overlay 因此渲染在输入框上方（composer 卡片内）。 */}
-    <Integration engine={engine} registerAttachmentInserter={registerAttachmentInserter} completionProvider={completionProvider} />
+    <Integration engine={engine} registerAttachmentInserter={registerAttachmentInserter} completionProvider={completionProvider} intake={intake} />
     <div className="rich-editor">
       <PlainTextPlugin
         contentEditable={<ContentEditable data-testid="editor" aria-label="消息" />}

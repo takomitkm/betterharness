@@ -471,3 +471,123 @@ test('B23: stale query results are unpickable — slow old query is ignored, pen
   assert.equal(records[0].snapshot.references.length, 1);
   assert.deepEqual(await orderedOf(page, 0), ['composer-mention|text']);
 });
+
+// 统一准入（步骤 4）：粘贴/拖放的 DataTransfer 全部在页面内用构造器合成（ClipboardEvent/
+// DragEvent 的 init 都带 dataTransfer），三个入口共用 ChatComposer 的 runIntake。
+// files: [{ name, type, data?, size? }]（data 为文本内容；size 为随机字节数，用于超大文件）。
+const pasteWith = (page, files, text) => page.evaluate(({ files, text }) => {
+  const transfer = new DataTransfer();
+  for (const { name, type, data, size } of files) {
+    transfer.items.add(new File([data ?? new Uint8Array(size ?? 0)], name, { type }));
+  }
+  if (text !== undefined) transfer.setData('text/plain', text);
+  document.querySelector('[data-testid=editor]').dispatchEvent(
+    new ClipboardEvent('paste', { clipboardData: transfer, bubbles: true, cancelable: true }));
+}, { files, text });
+
+test('B24: pasting a file on the rich editor intakes it — card, node at cursor, bytes submitted', async (t) => {
+  const { page, scope } = await openPage(t, { editor: 'rich' });
+  await editorOf(page).click();
+  await page.keyboard.type('前');
+  await pasteWith(page, [{ name: '粘贴.png', type: 'image/png', data: '粘贴字节' }]);
+  await page.waitForFunction(() => {
+    const view = window.composerTest.engine.getSnapshot();
+    return !view.dirty && view.state.draft.snapshot.attachments.length === 1;
+  });
+  // 图片缩略图卡片出现；有序文档在光标处（'前' 之后）获得附件节点。
+  assert.equal(await page.locator('[data-testid=attachment-thumb]').count(), 1);
+  assert.equal(await page.locator('[data-testid=editor] .attachment').count(), 1);
+  assert.deepEqual(await orderedOf(page, null), ['text|composer-attachment']);
+  await page.getByTestId('scenario').selectOption('hold');
+  await editorOf(page).press('Enter'); await held(page);
+  await page.getByTestId('release').click(); await waitStatus(page, 'accepted');
+  const records = await messages(page, scope);
+  assert.equal(records.length, 1);
+  assert.equal(Buffer.from(records[0].snapshot.attachments[0].bytes, 'base64').toString(), '粘贴字节');
+  assert.equal(await page.evaluate(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.attachments.length), 0);
+});
+
+test('B25: pasting text and a file together lands both — text inserted, card present', async (t) => {
+  const { page } = await openPage(t, { editor: 'rich' });
+  await editorOf(page).click();
+  await pasteWith(page, [{ name: '双份.txt', type: 'text/plain', data: '文件字节' }], '正文粘贴');
+  await page.waitForFunction(() => {
+    const view = window.composerTest.engine.getSnapshot();
+    return !view.dirty && view.state.draft.snapshot.attachments.length === 1
+      && view.state.draft.snapshot.text === '正文粘贴';
+  });
+  assert.equal(await page.locator('[data-testid=attachment-card]').count(), 1);
+  // 文件先准入，text/plain 原文随后插入；附件节点最终落在选区末端之后。
+  assert.deepEqual(await orderedOf(page, null), ['text|composer-attachment']);
+});
+
+test('B26: document drop shows the overlay, drop adds card and node, and no stuck overlay remains', async (t) => {
+  const { page, scope } = await openPage(t, { editor: 'rich' });
+  await editorOf(page).click();
+  await page.keyboard.type('AB');
+  await page.evaluate(() => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(['拖入字节'], '拖入.txt', { type: 'text/plain' }));
+    document.body.dispatchEvent(new DragEvent('dragenter', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+  });
+  await page.getByTestId('drop-overlay').waitFor();
+  // dragover 由文档级监听处理：处理器跑了（defaultPrevented）且处于接纳态（遮罩文案）。
+  // 合成事件的 DataTransfer.dropEffect 读回是 Chromium 实现细节——真实拖拽会话才兑现，
+  // DSH 也不对合成事件断言它，故不作为契约。
+  const state = await page.evaluate(() => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(['拖入字节'], '拖入.txt', { type: 'text/plain' }));
+    const event = new DragEvent('dragover', { dataTransfer: transfer, bubbles: true, cancelable: true });
+    document.body.dispatchEvent(event);
+    return {
+      defaultPrevented: event.defaultPrevented,
+      overlayText: document.querySelector('[data-testid=drop-overlay]')?.textContent ?? '',
+    };
+  });
+  assert.equal(state.defaultPrevented, true);
+  assert.ok(state.overlayText.includes('松开鼠标'), state.overlayText);
+  await page.evaluate(() => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(['拖入字节'], '拖入.txt', { type: 'text/plain' }));
+    document.body.dispatchEvent(new DragEvent('drop', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+  });
+  await page.waitForFunction(() => {
+    const view = window.composerTest.engine.getSnapshot();
+    return !view.dirty && view.state.draft.snapshot.attachments.length === 1;
+  });
+  assert.equal(await page.locator('[data-testid=attachment-card]').count(), 1);
+  assert.deepEqual(await orderedOf(page, null), ['text|composer-attachment']);
+  // dragDepth 已随 drop 重置：遮罩不得残留（否则后续真实拖拽的计数会错）。
+  assert.equal(await page.locator('[data-testid=drop-overlay]').count(), 0);
+  await page.getByTestId('scenario').selectOption('hold');
+  await editorOf(page).press('Enter'); await held(page);
+  await page.getByTestId('release').click(); await waitStatus(page, 'accepted');
+  const records = await messages(page, scope);
+  assert.equal(Buffer.from(records[0].snapshot.attachments[0].bytes, 'base64').toString(), '拖入字节');
+});
+
+test('B27: policy rejection warns with names and reasons; accepted siblings are still added', async (t) => {
+  const { page } = await openPage(t, { editor: 'rich' });
+  await editorOf(page).click();
+  // 演示策略：单文件 2 MiB 上限。3 MiB 的文件按单文件大小只拒绝自己；同批正常文件照常进入。
+  await pasteWith(page, [
+    { name: '超大.png', type: 'image/png', size: 3 * 1024 * 1024 },
+    { name: '正常.txt', type: 'text/plain', data: 'ok' },
+  ]);
+  await page.getByTestId('intake-warning').waitFor();
+  const warning = await page.getByTestId('intake-warning').textContent();
+  assert.match(warning, /超大\.png/);
+  assert.match(warning, /超过单个文件大小上限/);
+  assert.doesNotMatch(warning, /正常\.txt/);
+  await page.waitForFunction(() => {
+    const view = window.composerTest.engine.getSnapshot();
+    return !view.dirty && view.state.draft.snapshot.attachments.length === 1;
+  });
+  assert.equal(await page.evaluate(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.attachments[0].name), '正常.txt');
+  assert.equal(await page.locator('[data-testid=attachment-card]').count(), 1);
+  // 警告可关闭；拒绝不阻塞发送——正常文件随消息成功送达。
+  await page.getByTestId('intake-dismiss').click();
+  assert.equal(await page.locator('[data-testid=intake-warning]').count(), 0);
+  await page.getByTestId('scenario').selectOption('normal');
+  await editorOf(page).press('Enter'); await waitStatus(page, 'accepted');
+});
