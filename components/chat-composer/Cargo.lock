@@ -12,6 +12,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "composer-bridge-protocol"
+version = "0.1.0"
+dependencies = [
+ "composer-core",
+ "composer-runtime",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "composer-completion"
 version = "0.1.0"
 
