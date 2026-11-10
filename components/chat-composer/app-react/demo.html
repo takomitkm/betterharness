@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Betterharness · Reliable Chat Composer</title>
+  <style>
+    :root{color-scheme:light;--ink:#172b2a;--muted:#596d69;--line:#d9e4df;--accent:#176a54;--paper:#fffefb}
+    *{box-sizing:border-box}body{margin:0;background:#f3f6f1;color:var(--ink);font:15px/1.6 system-ui,"Microsoft YaHei",sans-serif}
+    main{max-width:900px;margin:0 auto;padding:48px 22px}h1{margin:8px 0;font-size:clamp(25px,4vw,36px);line-height:1.3}
+    header>p:last-child,footer{color:var(--muted)}.eyebrow{font:12px/1.5 ui-monospace,monospace;letter-spacing:.1em;color:var(--accent)}
+    .demo-settings,.host-controls,.composer-actions{display:flex;gap:14px;align-items:center;flex-wrap:wrap}.demo-settings{margin:24px 0}
+    label{display:flex;gap:8px;align-items:center;font-size:13px}select,button,input{font:inherit}select,button{border:1px solid var(--line);border-radius:7px;padding:7px 11px;background:var(--paper);color:var(--ink)}
+    button{cursor:pointer}button:hover:not(:disabled){border-color:var(--accent)}button:disabled{opacity:.45;cursor:default}button:focus-visible,select:focus-visible,textarea:focus-visible,[contenteditable]:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+    [data-testid=send]{background:var(--accent);color:white;border-color:var(--accent)}.chat-composer{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:20px}
+    textarea,[contenteditable]{font:16px/1.7 inherit;min-height:120px;width:100%;border:0;resize:vertical;outline:none;background:transparent;color:inherit;padding:8px}
+    .rich-editor{position:relative;border-bottom:1px solid var(--line);margin-bottom:10px}.placeholder{position:absolute;top:8px;left:8px;color:var(--muted);pointer-events:none}.composer-paragraph{margin:0}.mention{background:#dceee5;color:#155941;border-radius:4px;padding:1px 4px}.attachment{display:inline-block;background:#e9e3f5;border:1px dashed #7a6ba3;border-radius:4px;margin:0 3px;padding:1px 4px;vertical-align:baseline;font-size:12px;color:#5b4a8a}.attachment::after{content:"附件"}
+    .composer-actions input[type=file]{max-width:190px;font-size:12px}
+    .attachment-rail-root{display:flex;align-items:center;gap:4px;margin:10px 0}
+    .attachment-rail{display:flex;gap:10px;overflow-x:auto;scrollbar-width:none;flex:1;padding:4px 2px}
+    .attachment-rail::-webkit-scrollbar{display:none}
+    .rail-item{flex:0 0 auto}
+    .rail-arrow{width:26px;height:26px;padding:0;border-radius:50%;font-size:15px;line-height:1;flex:0 0 auto}
+    .attachment-image{position:relative;display:inline-flex;flex-direction:column;gap:3px}
+    .attachment-image-open{display:block;width:64px;height:64px;padding:0;border:1px solid var(--line);border-radius:8px;background:#fff;overflow:hidden;cursor:zoom-in}
+    .attachment-image-open:disabled{cursor:default}
+    .attachment-image-open img{width:100%;height:100%;object-fit:cover;display:block}
+    .attachment-image-pending{display:flex;width:100%;height:100%;align-items:center;justify-content:center;color:var(--muted)}
+    .attachment-remove{position:absolute;top:-7px;right:-7px;width:18px;height:18px;padding:0;border-radius:50%;font-size:11px;line-height:1;background:var(--paper)}
+    .attachment-moves{display:flex;gap:4px}
+    .attachment-move{font-size:11px;line-height:1.4;padding:1px 7px}
+    .attachment-image-tools{display:flex;gap:4px;align-items:center}
+    .attachment-mode{font-size:11px;line-height:1.4;padding:1px 7px}
+    .attachment-mode[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}
+    .attachment-alt{font-size:11px;width:88px;padding:1px 6px;border:1px solid var(--line);border-radius:6px;background:var(--paper);color:inherit}
+    .attachment-file{display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:8px;background:var(--paper);padding:6px 9px;max-width:230px}
+    .attachment-file-icon{width:28px;height:28px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;border-radius:6px;background:#e9e3f5;color:#5b4a8a;font-size:12px;font-weight:600;text-transform:uppercase}
+    .attachment-file-body{display:flex;flex-direction:column;min-width:0}
+    .attachment-file-name{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px}
+    .attachment-file-meta{font-size:11px;color:var(--muted)}
+    .drop-overlay{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;background:rgba(23,106,84,.08);pointer-events:none}
+    .drop-overlay-card{background:var(--paper);border:2px dashed var(--accent);border-radius:16px;padding:24px 36px;text-align:center}
+    .drop-overlay-card[data-disabled="true"]{border-color:#979da6;color:var(--muted)}
+    .drop-overlay-title{font-size:16px;font-weight:600}
+    .drop-overlay-desc{font-size:12px;color:var(--muted);margin-top:6px}
+    .lightbox{position:fixed;inset:0;z-index:70;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:rgba(12,20,19,.72);cursor:zoom-out}
+    .lightbox img{max-width:min(86vw,960px);max-height:78vh;border-radius:10px;background:#fff;cursor:default}
+    .lightbox-close{align-self:center}
+    [data-testid=intake-warning]{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+    [role=status]{font-size:13px;color:var(--muted)}[role=alert]{background:#fff1da;border-radius:6px;padding:10px}
+    ol{list-style:none;margin:16px 0 0;padding:0;display:grid;gap:10px}li{border-top:1px solid var(--line);padding:14px 0 4px}li strong{font-size:12px;color:var(--muted)}li[data-status=unknown] strong{color:#945e04}li[data-status=rejected] strong{color:#a93b35}li[data-status=accepted] strong{color:var(--accent)}
+    .message-text{white-space:pre-wrap;overflow-wrap:anywhere;margin:5px 0}li small{display:block;color:var(--muted)}li button{font-size:12px;margin:8px 8px 0 0}.host-controls{margin:18px 0;font-size:13px}footer{border-top:1px solid var(--line);padding-top:16px;font-size:12px}
+    @media(max-width:540px){main{padding:24px 14px}.chat-composer{padding:14px}.demo-settings{align-items:stretch;flex-direction:column}.demo-settings label{justify-content:space-between}}
+  </style>
+</head>
+<body><div id="root"></div><script type="module" src="./demo.js"></script></body>
+</html>

@@ -26,11 +26,12 @@ Release 构建：`cargo build --release --workspace` ✓（~10s）。
 10/10 crate `cargo check --target wasm32-unknown-unknown` 通过（Go 门成立）。
 app-web（dioxus web）：`cargo check --target wasm32-unknown-unknown` ✓（此前已验证，本基线未重复跑全量构建）。
 
-## 3. archive/ts 测试环境（Phase 1 恢复对象，本基线未执行）
+## 3. app-react（Phase 1 恢复产物，2026-11-11 校机实测）
 
-- 浏览器测试：`node --test verify/demo-playwright.mjs`（34 项 B01–B32），需要 Playwright + Edge（校机配方 `CE_BROWSER_CHANNEL=msedge`）；npm ci 依赖 package-lock.json。
-- 历史成绩（封存时）：76 单元 + 34 浏览器 + 14/14 变异全绿（main=6d7e456 时点）。
-- 说明：archive 按计划不改；这些命令在 Phase 1 复活到 app-react 后重新计入基线。
+- `npm ci` + typecheck ✓；**单元 76/76、浏览器 34/34（CE_BROWSER_CHANNEL=msedge）、变异 14/14 killed** 全绿。
+- 说明：app-react = archive/ts 原样复活（引擎仍是 TS core.ts，属受控测试 Adapter；
+  PRODUCT-LINE-PLAN §4.4），数字与 archive 封存时一致，恢复过程零回归。
+- Phase 2 接 Bridge 后本表作为回归参照：任何一档变差即停下排查。
 
 ## 4. 变异测试（archive/ts，历史）
 

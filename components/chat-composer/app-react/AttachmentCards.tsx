@@ -1,0 +1,288 @@
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
+import type { AssetId, Attachment } from "./types.ts";
+import { formatBytes, type IntakePolicy } from "./intake.ts";
+
+// 附件呈现（对应 DSH ui-attachment 的 AttachmentRail / FileCard / DropOverlay / 预览）：
+//   - 图片缩略图：object-URL 预览，点击开灯箱；文件卡：类型占位符/扩展名首字母、名称、扩展名+大小、移除；
+//   - 「前移/后移」按钮：拖动的键盘/触屏替代（移动本体在编辑器侧，见 reorder.ts 与 moveAttachmentNode）；
+//   - 横向 rail：边缘翻页箭头按滚动几何 + ResizeObserver 重算；滚轮只横滚 rail
+//     （非 passive 监听、preventDefault、LINE/PAGE 增量归一、每格钳制、reduced-motion 降级）；
+//   - 新附件滚入视野；整个 rail 因草稿清空而卸载、又随附件重新挂载时保持起始位置（不跳到末尾）；
+//   - object-URL 纪律：每个视图（缩略图/灯箱）拥有自己的 URL，按 AssetId 创建、卸载/换资产即释放；
+//     被移除资产的晚到预览加载不会复活卡片（URL 已随卸载失效，卡片本身也从快照消失）；
+//     草稿重排（移动）不改本列表、不重挂卡片，URL 因此零重建。
+// 本文件只做呈现：数据全部来自快照，无上传生命周期（字节在本地，发送载荷已携带；见 README）。
+
+/** 拖放遮罩的限额文案（演示与宿主共用；纯文本拼装，无策略时返回空串）。 */
+export function intakeLimitsText(policy: IntakePolicy): string {
+  const parts: string[] = [];
+  if (policy.maxFiles !== undefined) parts.push(`最多 ${policy.maxFiles} 个文件`);
+  if (policy.maxBytesPerFile !== undefined) parts.push(`单个不超过 ${formatBytes(policy.maxBytesPerFile)}`);
+  if (policy.maxBytesTotal !== undefined) parts.push(`总共不超过 ${formatBytes(policy.maxBytesTotal)}`);
+  if (policy.allowedMediaTypes?.length) parts.push(`仅支持 ${[...policy.allowedMediaTypes].join("、")}`);
+  return parts.join(" · ");
+}
+
+/** 全视口拖放邀请（DSH DragMask 同款）：装饰层，pointer-events: none 让拖放目标穿透到页面，
+ * 文档级监听保持准确的 enter/leave 计数并独占 accept/reject。经 body portal 渲染，躲开变换祖先。 */
+export function DropOverlay({ disabled, title, desc }: { disabled: boolean; title: string; desc?: string }) {
+  return createPortal(
+    <div className="drop-overlay" data-testid="drop-overlay" role="status">
+      <div className="drop-overlay-card" data-disabled={disabled ? "true" : "false"}>
+        <div className="drop-overlay-title">{title}</div>
+        {!disabled && desc && <div className="drop-overlay-desc">{desc}</div>}
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+export function isImageType(mediaType: string): boolean {
+  return mediaType.startsWith("image/");
+}
+
+/** 文件扩展名（小写）；无扩展名或以点结尾返回空串。 */
+export function fileExtensionOf(name: string): string {
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0 || dot === name.length - 1) return "";
+  return name.slice(dot + 1).toLowerCase();
+}
+
+/**
+ * 按资产身份创建 object URL：依赖只有 AssetId——引擎每次发布都会 structuredClone 快照，
+ * Blob 是字节相同的新副本，不能按对象身份重建 URL。effect 闭包始终来自最近一次渲染，
+ * 换资产时拿到的是新资产的 Blob。卸载或换资产即释放——被移除资产的晚到预览加载
+ * 因此不可能复活卡片。
+ */
+function useAssetUrl(assetId: AssetId, data: Blob): string | null {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    const created = URL.createObjectURL(data);
+    setUrl(created);
+    return () => URL.revokeObjectURL(created);
+    // 故意只依赖 assetId：Blob 身份会因快照克隆而漂移，字节本身不可变。
+  }, [assetId]);
+  return url;
+}
+
+function ImageThumb({ attachment, disabled, moves, onRemove, onOpen, onAltChange, onToggleSendAsFile }: {
+  attachment: Attachment; disabled: boolean; moves: AttachmentMoveControl | null; onRemove: () => void; onOpen: () => void;
+  onAltChange?: (id: AssetId, alt: string) => void; onToggleSendAsFile?: (id: AssetId, sendAsFile: boolean) => void;
+}) {
+  const url = useAssetUrl(attachment.id, attachment.data);
+  const sendAsFile = attachment.sendAsFile === true;
+  return <span className="attachment-image" data-testid="attachment-thumb" data-asset-id={attachment.id}>
+    <button type="button" className="attachment-image-open" title="点击放大" aria-label={`查看 ${attachment.name}`} disabled={url === null} onClick={onOpen}>
+      {url === null ? <span className="attachment-image-pending" aria-hidden="true">…</span> : <img src={url} alt={attachment.alt || attachment.name} />}
+    </button>
+    <span className="attachment-image-tools">
+      {onToggleSendAsFile && <button type="button" className="attachment-mode" data-testid="attachment-send-as-file" aria-pressed={sendAsFile}
+        title="切换发送模式：压缩图（默认）/ 原图按文件发送（由宿主发送管线编码）"
+        aria-label={`${sendAsFile ? "原图" : "压缩"}发送 ${attachment.name}`} disabled={disabled}
+        onClick={() => onToggleSendAsFile(attachment.id, !sendAsFile)}>{sendAsFile ? "原图" : "压缩"}</button>}
+      {onAltChange && <input type="text" className="attachment-alt" data-testid="attachment-alt" placeholder="替代文本"
+        aria-label={`替代文本 ${attachment.name}`} value={attachment.alt ?? ""} disabled={disabled}
+        onChange={(event) => onAltChange(attachment.id, event.target.value)} />}
+    </span>
+    {moves && <AttachmentMoveButtons attachment={attachment} disabled={disabled} moves={moves} />}
+    <button type="button" className="attachment-remove" disabled={disabled} aria-label={`移除 ${attachment.name}`} onClick={onRemove}>×</button>
+  </span>;
+}
+
+function FileCardView({ attachment, disabled, moves, onRemove }: {
+  attachment: Attachment; disabled: boolean; moves: AttachmentMoveControl | null; onRemove: () => void;
+}) {
+  const extension = fileExtensionOf(attachment.name).toUpperCase().slice(0, 8);
+  const meta = [extension, formatBytes(attachment.data.size)].filter((part) => part !== "").join(" · ");
+  return <span className="attachment-file" data-testid="attachment-card" data-asset-id={attachment.id} title={attachment.name}>
+    <span className="attachment-file-icon" aria-hidden="true">{extension.charAt(0) || "文"}</span>
+    <span className="attachment-file-body" aria-label={`待发送文件 ${attachment.name}`}>
+      <span className="attachment-file-name">{attachment.name}</span>
+      <span className="attachment-file-meta">{meta || formatBytes(attachment.data.size)}</span>
+      {moves && <AttachmentMoveButtons attachment={attachment} disabled={disabled} moves={moves} />}
+    </span>
+    <button type="button" className="attachment-remove" disabled={disabled} aria-label={`移除 ${attachment.name}`} onClick={onRemove}>×</button>
+  </span>;
+}
+
+/** 「前移/后移」按钮（拖动的键盘/触屏替代，移动本体在编辑器侧 moveAttachmentNode）。 */
+function AttachmentMoveButtons({ attachment, disabled, moves }: {
+  attachment: Attachment; disabled: boolean; moves: AttachmentMoveControl;
+}) {
+  const fire = (target: number | null): void => {
+    if (target !== null) moves.fire(target);
+  };
+  return <span className="attachment-moves">
+    <button type="button" className="attachment-move" disabled={disabled || moves.backward === null} aria-label={`前移 ${attachment.name}`} onClick={() => fire(moves.backward)}>前移</button>
+    <button type="button" className="attachment-move" disabled={disabled || moves.forward === null} aria-label={`后移 ${attachment.name}`} onClick={() => fire(moves.forward)}>后移</button>
+  </span>;
+}
+
+/** 图片灯箱：自己拥有独立的 object URL；Esc 或点击背景关闭。 */
+function Lightbox({ attachment, onClose }: { attachment: Attachment; onClose: () => void }) {
+  const url = useAssetUrl(attachment.id, attachment.data);
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return createPortal(
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label={`预览 ${attachment.name}`} data-testid="lightbox" onClick={onClose}>
+      {url && <img src={url} alt={attachment.name} />}
+      <button type="button" className="lightbox-close" aria-label="关闭预览" onClick={onClose}>关闭预览</button>
+    </div>,
+    document.body,
+  );
+}
+
+interface RailItem {
+  id: AssetId;
+}
+
+/** Firefox 棘轮滚轮按行报告增量时的近似像素换算（DSH AttachmentRail 同款）。 */
+const WHEEL_LINE_PX = 16;
+
+/** 平滑翻页，除非用户系统要求减少动效。 */
+function pageBehavior(): ScrollBehavior {
+  const matchMedia = (window as { matchMedia?: Window["matchMedia"] }).matchMedia;
+  return matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
+}
+
+/**
+ * 横向附件 rail：滚动条隐藏，溢出用边缘箭头翻页（按滚动几何在 scroll/数量/rail 尺寸变化时重算，
+ * ResizeObserver 观察元素本身——侧栏/面板宽度变化也计入）。纵向滚轮横滚 rail 且独占消费；
+ * 新增附件滚到末尾露出；在已有草稿上重新挂载是初次布局而非增长，保持起始位置。
+ */
+function AttachmentRail<T extends RailItem>({ items, renderItem }: { items: readonly T[]; renderItem: (item: T) => ReactNode }) {
+  const railRef = useRef<HTMLDivElement | null>(null);
+  // null 标记首次布局：在已有草稿上重新挂载时不得跳到末尾。
+  const countRef = useRef<number | null>(null);
+  const [edges, setEdges] = useState({ left: false, right: false });
+  const updateEdges = useCallback(() => {
+    const el = railRef.current;
+    if (!el) return;
+    // 1px 余量：滚动位置在边缘处可能是小数。
+    const left = el.scrollLeft > 1;
+    const right = el.scrollLeft < el.scrollWidth - el.clientWidth - 1;
+    setEdges((previous) => (previous.left === left && previous.right === right ? previous : { left, right }));
+  }, []);
+  useLayoutEffect(() => {
+    const grew = countRef.current !== null && items.length > countRef.current;
+    countRef.current = items.length;
+    const el = railRef.current;
+    if (!el) return;
+    if (grew) el.scrollLeft = el.scrollWidth - el.clientWidth;
+    updateEdges();
+  }, [items.length, updateEdges]);
+  useEffect(() => {
+    const el = railRef.current;
+    if (!el) return;
+    let disconnect = (): void => {};
+    if (typeof ResizeObserver !== "undefined") {
+      const observer = new ResizeObserver(updateEdges);
+      observer.observe(el);
+      disconnect = () => observer.disconnect();
+    }
+    // rail 只横滚：带纵向分量的滚轮被独占消费（非 passive——React 根上的 wheel 监听是 passive 的），
+    // 否则会同时滚动后方的对话。LINE/PAGE 增量先归一成像素再做每格钳制，快速滚动仍跟手。
+    const onWheel = (event: WheelEvent): void => {
+      if (event.deltaY === 0) return;
+      const scale = event.deltaMode === WheelEvent.DOM_DELTA_LINE
+        ? WHEEL_LINE_PX
+        : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? el.clientWidth : 1;
+      event.preventDefault();
+      el.scrollBy({
+        left: event.deltaX !== 0
+          ? event.deltaX * scale
+          : Math.sign(event.deltaY) * Math.min(Math.abs(event.deltaY) * scale, 60),
+        behavior: "auto",
+      });
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      disconnect();
+      el.removeEventListener("wheel", onWheel);
+    };
+  }, [updateEdges]);
+  const page = (direction: -1 | 1): void => {
+    const el = railRef.current;
+    if (!el) return;
+    // 一屏减一张卡片：保留最后一张可见缩略图作上下文；下限保证窄 rail 也能翻出有用距离。
+    el.scrollBy({ left: direction * Math.max(el.clientWidth - 64, 200), behavior: pageBehavior() });
+  };
+  return <div className="attachment-rail-root">
+    {edges.left && <button type="button" className="rail-arrow" aria-label="向前翻" onClick={() => page(-1)}>‹</button>}
+    <div ref={railRef} className="attachment-rail" role="group" aria-label="草稿附件" data-testid="attachment-rail" onScroll={updateEdges}>
+      {items.map((item) => <span key={item.id} className="rail-item">{renderItem(item)}</span>)}
+    </div>
+    {edges.right && <button type="button" className="rail-arrow" aria-label="向后翻" onClick={() => page(1)}>›</button>}
+  </div>;
+}
+
+/** 单张卡片的移动能力：backward/forward 是目标附件下标（语义见 reorder.ts），
+ * null = 该方向不可移（已在端点 / 附件不在有序文档里 / 没有移动入口）。 */
+export interface AttachmentMoveControl {
+  backward: number | null;
+  forward: number | null;
+  fire: (targetAttachmentIndex: number) => void;
+}
+
+export interface AttachmentCardsProps {
+  /** 草稿附件条目（快照事实来源）。 */
+  attachments: readonly Attachment[];
+  /** 交接窗口（admitting）：移除/移动按钮禁用，与其它编辑入口一致。 */
+  disabled: boolean;
+  onRemove: (id: AssetId) => void;
+  /**
+   * 有序文档里的附件 AssetId 序列（文档顺序，不是 attachments 列表顺序）。
+   * 缺省 = 没有有序文档（纯文本模式）：不提供移动——rail-only 不对称（见 README）。
+   */
+  attachmentOrder?: readonly AssetId[];
+  /** 移动入口（ChatComposer 转发给编辑器注册的 mover）；与 attachmentOrder 成对提供。 */
+  onMoveAttachment?: (assetId: AssetId, targetAttachmentIndex: number) => void;
+  /** 图片卡替代文本（无障碍）提交入口；缺省不渲染输入。每次输入都经引擎 CAS 落盘（与正文同纪律）。 */
+  onAltChange?: (id: AssetId, alt: string) => void;
+  /** 图片卡「压缩/原图」切换入口；缺省不渲染切换。组件只存标志，编码由宿主发送管线消费。 */
+  onToggleSendAsFile?: (id: AssetId, sendAsFile: boolean) => void;
+}
+
+/**
+ * 草稿附件的卡片呈现：图片缩略图 + 文件卡 + 灯箱，装在横向 rail 里。没有附件时不渲染。
+ * 不变量：卡片（与 object-URL）按 AssetId 键控，附件「移动」只改有序文档、不改本列表——
+ * 重排草稿时 rail 不重挂、预览 URL 不重建（useAssetUrl 只依赖 assetId）。
+ */
+export function AttachmentCards({ attachments, disabled, onRemove, attachmentOrder, onMoveAttachment, onAltChange, onToggleSendAsFile }: AttachmentCardsProps) {
+  // 灯箱以 AssetId 记忆：对应附件被移除时预览必须跟着关（DSH：图片消失时关闭它的预览）。
+  const [previewId, setPreviewId] = useState<AssetId | null>(null);
+  useEffect(() => {
+    if (previewId !== null && !attachments.some((item) => item.id === previewId)) setPreviewId(null);
+  }, [attachments, previewId]);
+  const preview = previewId === null ? null : attachments.find((item) => item.id === previewId) ?? null;
+  // hooks 必须在顶层先全部执行完，之后才允许按内容提前返回。
+  if (attachments.length === 0) return null;
+  const moveControlOf = (id: AssetId): AttachmentMoveControl | null => {
+    if (!onMoveAttachment || !attachmentOrder) return null; // 无移动入口（纯文本模式）：不渲染按钮。
+    const current = attachmentOrder.indexOf(id);
+    if (current < 0) {
+      // rail-only 附件（尚未插入文档）：按钮可见但不可移，功能存在与否一目了然。
+      return { backward: null, forward: null, fire: () => {} };
+    }
+    return {
+      backward: current > 0 ? current - 1 : null,
+      forward: current < attachmentOrder.length - 1 ? current + 1 : null,
+      fire: (target) => onMoveAttachment(id, target),
+    };
+  };
+  const items = attachments.map((attachment) => ({ id: attachment.id, attachment }));
+  return <>
+    <AttachmentRail items={items} renderItem={({ attachment }) => (
+      isImageType(attachment.mediaType)
+        ? <ImageThumb attachment={attachment} disabled={disabled} moves={moveControlOf(attachment.id)} onRemove={() => onRemove(attachment.id)} onOpen={() => setPreviewId(attachment.id)} onAltChange={onAltChange} onToggleSendAsFile={onToggleSendAsFile} />
+        : <FileCardView attachment={attachment} disabled={disabled} moves={moveControlOf(attachment.id)} onRemove={() => onRemove(attachment.id)} />
+    )} />
+    {preview && <Lightbox attachment={preview} onClose={() => setPreviewId(null)} />}
+  </>;
+}
