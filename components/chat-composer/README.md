@@ -43,7 +43,7 @@ queued ── 保存 sending 标记 ──► sending ──► accepted
 | `CandidateMenu.tsx` | 候选菜单列表框：aria-activedescendant、行 mousedown 保持编辑器选区、真实 mousemove 移动高亮、外部按下关闭 |
 | `intake.ts` | 文件准入纯模块（零依赖）：IntakePolicy/intakeFiles 整批与逐文件裁决、splitClipboard 粘贴路由判定、formatBytes |
 | `reorder.ts` | 附件重排纯模块（零依赖）：附件序列上的移动跨度 computeMoveSpan（目标下标钳制、同位无操作） |
-| `AttachmentCards.tsx` | 附件呈现：横向 rail（翻页箭头/滚轮横滚）、图片缩略图 + 灯箱、文件卡、全视口拖放遮罩；object-URL 生命周期归每个视图所有 |
+| `AttachmentCards.tsx` | 附件呈现：横向 rail（翻页箭头/滚轮横滚）、图片缩略图 + 灯箱、文件卡、全视口拖放遮罩；图片卡的 alt 替代文本与「压缩/原图」开关；object-URL 生命周期归每个视图所有 |
 | `http-transport.ts` | 示例 HTTP 绑定：完整快照、幂等键、回执查询 |
 | `demo.tsx` / `demo.html` | 使用上述生产实现的交互演示，不另写一套状态机 |
 | `verify/` | 核心故障测试、真实浏览器测试、临时副本变异验证与演示服务 |
@@ -127,6 +127,7 @@ store.close();
 - IME 组合确认：交给输入法；组合结束后 10ms 宽限期内仍按组合处理（防 Safari 把确认键再报成普通 Enter）。
 - 候选菜单开启时：Enter 只确认高亮候选（不发送不换行），↑/↓ 移动高亮，Esc 关闭；pending 时 Enter 被吞掉。
 - 空编辑器的 Up：取回最近一条尚未派发的排队消息；有空白、附件或引用时也不覆盖。
+- 可见队列（`data-testid=outbox` 的提交记录列表）：queued 行提供**逐条「取回编辑」**——整条快照（含附件字节）交回草稿、行状态转 `cancelled`（引擎 `restore(id)`，与「取回最近一条」同一条已验证路径）。取回是整体替换，要求当前草稿为空（非空时按钮禁用并提示），不会覆盖未保存输入；在途 sending 与 unknown 行不可取回。发送中可继续打字并提交下一条（FIFO），这正是队列行的来源。
 - `queue`：完整快照入队；对应轮次结束后只派发下一条，等新轮次结束再推进。
 - `steer`：向当前轮次提交；`none`：保留草稿不投递。
 
@@ -166,6 +167,12 @@ store.close();
 **呈现**（`AttachmentCards.tsx`）：横向 rail，图片缩略图（object-URL 预览，点击开灯箱，附件被移除时预览随关）与文件卡（类型占位符/扩展名首字母、名称、扩展名 + 大小、移除）；边缘翻页箭头按滚动几何 + `ResizeObserver` 重算；滚轮只横滚 rail（非 passive、LINE/PAGE 增量归一、每格钳制、reduced-motion 降级）；新附件滚入视野，rail 重新挂载保持起始位置。
 
 **范围与后续（宿主集成点）**：字节始终在本地，发送载荷直接携带它们，因此这里没有 DSH 的上传生命周期——`FileCard`/图片缩略图的 uploading/ready/error 状态、进度轨道、失败重试（可重试错误与明确拒绝分开）是留给真实宿主上传管线的集成点，本组件不伪造进度。粘贴文件入口目前只在富文本编辑器接线（textarea 的 paste-files 暂缓，与菜单 rail-only 同款不对称）；拖放在两种模式都可用（textarea 模式附件保持 rail-only，不进有序文档）。
+
+**异步上传的推荐模式：占位符 + 回写核锚点。** 宿主把上传管线接进来时（字节上云、组件里留引用），推荐 Discourse 式做法：准入时立刻在文档里放一个可见的占位节点/卡片（用户知道内容在哪），上传完成后再把占位替换为最终内容。替换时**必须重新核对两件事**：草稿还是原来那份（generation/revision 没变，或经引擎 CAS 重取最新），占位节点还在文档里（NodeId 能找到）。Discourse 在这一步踩过真实坑——替换占位符时不核对光标，把用户正在输入的光标顶到行尾（meta.discourse.org/t/cursor-is-overriden-when-upload-finishes/54892）。本组件的对应纪律已经内置：异步回写一律走 `engine.edit` 的 CAS（草稿变了就失败重来），异步插入前核对条目落盘（`runIntake` 的 after 时序），键盘移动以 DOM 选区为事实源。
+
+**附件元数据**：图片卡提供两个可选入口（宿主不给回调就不渲染）——替代文本 `alt`（无障碍，进入 `<img>` alt 与发送载荷）与「压缩/原图」开关 `sendAsFile`（`true` = 原图按文件发送）。两者都随快照持久化、跨刷新保留；组件只存储标志，压缩/原样编码由宿主发送管线消费——不伪造上传行为。
+
+**复制粘贴附件节点（私有 MIME）**：复制/剪切选中附件节点时，剪贴板额外携带私有 MIME `application/x-betterharness-composer-attachment`（AssetId 列表，Element 的 pills 思路）；粘贴时优先识别它——同草稿内粘贴 = **新节点引用同一资产**（NodeId 全新以满足文档唯一性，AssetId 复用，`attachments` 列表零增长，字节零拷贝），一次 `editor.update` = 一步撤销。资产不在当前草稿（跨草稿粘贴或已移除）时放弃 MIME 走常规路径，绝不凭 MIME 造悬空引用。返回 false 不消费命令，Lexical 的默认复制/剪切（HTML、纯文本）照常进行。
 
 ## 正文中的附件节点与移动（富文本）
 

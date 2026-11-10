@@ -1,7 +1,7 @@
 export { createComposer, ComposerEngine } from "./core.ts";
 export { IndexedDbComposerStore, MemoryComposerStore } from "./store.ts";
 export { ChatComposer, TextareaEditor } from "./ChatComposer.tsx";
-export { LexicalEditor, ComposerMentionNode, ComposerAttachmentNode, insertAttachmentNode, moveAttachmentNode } from "./LexicalEditor.tsx";
+export { LexicalEditor, ComposerMentionNode, ComposerAttachmentNode, insertAttachmentNode, insertAttachmentNodes, moveAttachmentNode, COMPOSER_CLIPBOARD_MIME } from "./LexicalEditor.tsx";
 export { CandidateMenu } from "./CandidateMenu.tsx";
 export { AttachmentCards, DropOverlay, fileExtensionOf, isImageType } from "./AttachmentCards.tsx";
 export { intakeFiles, splitClipboard, formatBytes } from "./intake.ts";

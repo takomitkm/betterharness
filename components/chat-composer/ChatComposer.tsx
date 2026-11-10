@@ -6,7 +6,7 @@ import { useComposerSubmission } from "./useComposerSubmission.ts";
 import type { Candidate, TriggerKind } from "./completion.ts";
 import { intakeFiles, type FileMeta, type IntakePolicy, type IntakeRejection, type IntakeRejectionReason } from "./intake.ts";
 import { AttachmentCards, DropOverlay, intakeLimitsText } from "./AttachmentCards.tsx";
-import type { AssetId } from "./types.ts";
+import type { AssetId, Attachment } from "./types.ts";
 
 /** 候选来源（宿主提供）：reference 对应 @，slash 对应 /；返回候选数组或其 Promise。 */
 export type CompletionProvider = (kind: TriggerKind, query: string) => Candidate[] | Promise<Candidate[]>;
@@ -158,6 +158,18 @@ export function ChatComposer({ engine, Editor = TextareaEditor, placeholder = "�
     });
   }, [engine]);
 
+  // 附件元数据（图片 alt / 原图-压缩开关）：与正文同纪律，每次输入都经引擎 CAS 落盘。
+  // 只动 attachments 条目的可选字段，文档节点与 AssetId 不变。
+  const updateAttachmentMeta = useCallback((id: AssetId, patch: Partial<Pick<Attachment, "alt" | "sendAsFile">>) => {
+    const latest = engine.getSnapshot().state.draft.snapshot;
+    void engine.edit({
+      ...copy(latest),
+      attachments: latest.attachments.map((item) => (item.id === id ? { ...item, ...patch } : item)),
+    });
+  }, [engine]);
+  const onAltChange = useCallback((id: AssetId, alt: string) => updateAttachmentMeta(id, { alt }), [updateAttachmentMeta]);
+  const onToggleSendAsFile = useCallback((id: AssetId, sendAsFile: boolean) => updateAttachmentMeta(id, { sendAsFile }), [updateAttachmentMeta]);
+
   /**
    * 统一准入路径：文件选择器、粘贴、拖放都汇到这里（DSH InputBar.intakeFiles 的共享准入）。
    * 目录条目已由浏览器侧识别，记录名称并按不支持类型拒绝；其余走 intakeFiles 纯检查。
@@ -276,6 +288,7 @@ export function ChatComposer({ engine, Editor = TextareaEditor, placeholder = "�
     <AttachmentCards
       attachments={snapshot.attachments} disabled={view.admitting} onRemove={removeAttachment}
       attachmentOrder={documentAttachmentOrder} onMoveAttachment={onMoveAttachment}
+      onAltChange={onAltChange} onToggleSendAsFile={onToggleSendAsFile}
     />
     <div className="composer-actions">
       <label>添加附件 <input data-testid="files" type="file" multiple disabled={view.admitting} onChange={(event) => {
@@ -313,6 +326,13 @@ export function ChatComposer({ engine, Editor = TextareaEditor, placeholder = "�
         {record.snapshot.attachments.map((file) => <span key={file.id}>{file.name} ({file.data.size} B) </span>)}
         {record.reason && <small>{record.reason}</small>}
         {record.status === "unknown" && <button type="button" onClick={() => void engine.query(record.id)}>核对送达状态</button>}
+        {record.status === "queued" && <>
+          {/* 可见队列的逐条取回（DSH QueueDock 的 Edit 方向）：整条快照（含附件字节）交回
+              草稿、行状态转 cancelled；要求当前草稿为空——取回是整体替换，不覆盖未保存输入。 */}
+          <button type="button" disabled={!isEmptyDraft(snapshot) || view.admitting}
+            title={isEmptyDraft(snapshot) ? undefined : "清空当前草稿后可取回"}
+            onClick={() => void engine.restore(record.id)}>取回编辑</button>
+        </>}
         {record.status === "rejected" && <>
           <button type="button" onClick={() => void engine.retry(record.id)}>原样重试</button>
           <button type="button" disabled={!isEmptyDraft(snapshot) || view.admitting} onClick={() => void engine.restore(record.id)}>取回编辑</button>

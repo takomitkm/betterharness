@@ -66,14 +66,25 @@ function useAssetUrl(assetId: AssetId, data: Blob): string | null {
   return url;
 }
 
-function ImageThumb({ attachment, disabled, moves, onRemove, onOpen }: {
+function ImageThumb({ attachment, disabled, moves, onRemove, onOpen, onAltChange, onToggleSendAsFile }: {
   attachment: Attachment; disabled: boolean; moves: AttachmentMoveControl | null; onRemove: () => void; onOpen: () => void;
+  onAltChange?: (id: AssetId, alt: string) => void; onToggleSendAsFile?: (id: AssetId, sendAsFile: boolean) => void;
 }) {
   const url = useAssetUrl(attachment.id, attachment.data);
+  const sendAsFile = attachment.sendAsFile === true;
   return <span className="attachment-image" data-testid="attachment-thumb" data-asset-id={attachment.id}>
     <button type="button" className="attachment-image-open" title="点击放大" aria-label={`查看 ${attachment.name}`} disabled={url === null} onClick={onOpen}>
-      {url === null ? <span className="attachment-image-pending" aria-hidden="true">…</span> : <img src={url} alt={attachment.name} />}
+      {url === null ? <span className="attachment-image-pending" aria-hidden="true">…</span> : <img src={url} alt={attachment.alt || attachment.name} />}
     </button>
+    <span className="attachment-image-tools">
+      {onToggleSendAsFile && <button type="button" className="attachment-mode" data-testid="attachment-send-as-file" aria-pressed={sendAsFile}
+        title="切换发送模式：压缩图（默认）/ 原图按文件发送（由宿主发送管线编码）"
+        aria-label={`${sendAsFile ? "原图" : "压缩"}发送 ${attachment.name}`} disabled={disabled}
+        onClick={() => onToggleSendAsFile(attachment.id, !sendAsFile)}>{sendAsFile ? "原图" : "压缩"}</button>}
+      {onAltChange && <input type="text" className="attachment-alt" data-testid="attachment-alt" placeholder="替代文本"
+        aria-label={`替代文本 ${attachment.name}`} value={attachment.alt ?? ""} disabled={disabled}
+        onChange={(event) => onAltChange(attachment.id, event.target.value)} />}
+    </span>
     {moves && <AttachmentMoveButtons attachment={attachment} disabled={disabled} moves={moves} />}
     <button type="button" className="attachment-remove" disabled={disabled} aria-label={`移除 ${attachment.name}`} onClick={onRemove}>×</button>
   </span>;
@@ -232,6 +243,10 @@ export interface AttachmentCardsProps {
   attachmentOrder?: readonly AssetId[];
   /** 移动入口（ChatComposer 转发给编辑器注册的 mover）；与 attachmentOrder 成对提供。 */
   onMoveAttachment?: (assetId: AssetId, targetAttachmentIndex: number) => void;
+  /** 图片卡替代文本（无障碍）提交入口；缺省不渲染输入。每次输入都经引擎 CAS 落盘（与正文同纪律）。 */
+  onAltChange?: (id: AssetId, alt: string) => void;
+  /** 图片卡「压缩/原图」切换入口；缺省不渲染切换。组件只存标志，编码由宿主发送管线消费。 */
+  onToggleSendAsFile?: (id: AssetId, sendAsFile: boolean) => void;
 }
 
 /**
@@ -239,7 +254,7 @@ export interface AttachmentCardsProps {
  * 不变量：卡片（与 object-URL）按 AssetId 键控，附件「移动」只改有序文档、不改本列表——
  * 重排草稿时 rail 不重挂、预览 URL 不重建（useAssetUrl 只依赖 assetId）。
  */
-export function AttachmentCards({ attachments, disabled, onRemove, attachmentOrder, onMoveAttachment }: AttachmentCardsProps) {
+export function AttachmentCards({ attachments, disabled, onRemove, attachmentOrder, onMoveAttachment, onAltChange, onToggleSendAsFile }: AttachmentCardsProps) {
   // 灯箱以 AssetId 记忆：对应附件被移除时预览必须跟着关（DSH：图片消失时关闭它的预览）。
   const [previewId, setPreviewId] = useState<AssetId | null>(null);
   useEffect(() => {
@@ -265,7 +280,7 @@ export function AttachmentCards({ attachments, disabled, onRemove, attachmentOrd
   return <>
     <AttachmentRail items={items} renderItem={({ attachment }) => (
       isImageType(attachment.mediaType)
-        ? <ImageThumb attachment={attachment} disabled={disabled} moves={moveControlOf(attachment.id)} onRemove={() => onRemove(attachment.id)} onOpen={() => setPreviewId(attachment.id)} />
+        ? <ImageThumb attachment={attachment} disabled={disabled} moves={moveControlOf(attachment.id)} onRemove={() => onRemove(attachment.id)} onOpen={() => setPreviewId(attachment.id)} onAltChange={onAltChange} onToggleSendAsFile={onToggleSendAsFile} />
         : <FileCardView attachment={attachment} disabled={disabled} moves={moveControlOf(attachment.id)} onRemove={() => onRemove(attachment.id)} />
     )} />
     {preview && <Lightbox attachment={preview} onClose={() => setPreviewId(null)} />}

@@ -730,3 +730,150 @@ test('B29: Ctrl/Cmd+Shift+Arrow moves the attachment the caret sits next to; one
   await draftOrderIs(page, ORIGINAL_ORDER);
   assert.deepEqual(await attachmentNodesOf(page), originalNodes);
 });
+
+// —— 五项补强（2026-11-11）：剪贴板 MIME / alt 与原图开关 / 可见队列逐条取回 ——
+
+test('B30: copying an attachment node writes the private MIME; pasting clones the reference with zero byte copy', async (t) => {
+  const { page } = await openPage(t, { editor: 'rich' });
+  await editorOf(page).click();
+  await page.keyboard.type('AB');
+  await page.locator('[data-testid=editor]').press('ArrowLeft');
+  await page.getByTestId('files').setInputFiles({ name: 'clip.png', mimeType: 'image/png', buffer: Buffer.from('clip-bytes') });
+  await page.waitForFunction(() => {
+    const view = window.composerTest.engine.getSnapshot();
+    return !view.dirty && view.state.draft.snapshot.attachments.length === 1;
+  });
+  const assetId = await page.evaluate(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.attachments[0].id);
+  const originalNodeId = await page.evaluate(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.document.value.root.children[0].children
+    .find((node) => node.type === 'composer-attachment').nodeId);
+  // 选中全文并复制：私有 MIME 携带附件 AssetId；Lexical 默认复制（text/html、text/plain）不受影响。
+  await editorOf(page).press('Control+a');
+  const mime = await page.evaluate(() => {
+    const root = document.querySelector('[data-testid=editor]');
+    const transfer = new DataTransfer();
+    root.dispatchEvent(new ClipboardEvent('copy', { clipboardData: transfer, bubbles: true, cancelable: true }));
+    return transfer.getData('application/x-betterharness-composer-attachment');
+  });
+  assert.deepEqual(JSON.parse(mime), [{ assetId }]);
+  // 粘贴（选区仍为全选——方向键只动 DOM 选区，Lexical 内部选区滞后，B29 同款）：
+  // 语义 = 替换选区为引用克隆：新 NodeId、同一 AssetId、attachments 列表零增长、字节不复制。
+  await page.evaluate((mime) => {
+    const root = document.querySelector('[data-testid=editor]');
+    const transfer = new DataTransfer();
+    transfer.setData('application/x-betterharness-composer-attachment', mime);
+    root.dispatchEvent(new ClipboardEvent('paste', { clipboardData: transfer, bubbles: true, cancelable: true }));
+  }, mime);
+  await page.waitForFunction(() => {
+    const view = window.composerTest.engine.getSnapshot();
+    return !view.dirty && view.state.draft.snapshot.document.value.root.children[0].children
+      .filter((node) => node.type === 'composer-attachment').length === 1
+      && view.state.draft.snapshot.document.value.root.children[0].children.length === 1;
+  });
+  const afterReplace = await page.evaluate(() => {
+    const view = window.composerTest.engine.getSnapshot();
+    const node = view.state.draft.snapshot.document.value.root.children[0].children[0];
+    return { assetId: node.assetId, nodeId: node.nodeId, assetCount: view.state.draft.snapshot.attachments.length };
+  });
+  assert.equal(afterReplace.assetId, assetId);
+  assert.notEqual(afterReplace.nodeId, originalNodeId);
+  assert.equal(afterReplace.assetCount, 1);
+  // 替换后选区已收缩到克隆节点之后：再贴一次 = 在光标处插入第二个引用克隆。
+  await page.evaluate((mime) => {
+    const root = document.querySelector('[data-testid=editor]');
+    const transfer = new DataTransfer();
+    transfer.setData('application/x-betterharness-composer-attachment', mime);
+    root.dispatchEvent(new ClipboardEvent('paste', { clipboardData: transfer, bubbles: true, cancelable: true }));
+  }, mime);
+  await page.waitForFunction(() => {
+    const view = window.composerTest.engine.getSnapshot();
+    return !view.dirty && view.state.draft.snapshot.document.value.root.children[0].children
+      .filter((node) => node.type === 'composer-attachment').length === 2;
+  });
+  const cloned = await page.evaluate(() => {
+    const view = window.composerTest.engine.getSnapshot();
+    const nodes = view.state.draft.snapshot.document.value.root.children[0].children
+      .filter((node) => node.type === 'composer-attachment')
+      .map((node) => `${node.assetId}/${node.nodeId}`);
+    return { nodes, assetCount: view.state.draft.snapshot.attachments.length, bytes: view.state.draft.snapshot.attachments[0].data.size };
+  });
+  assert.equal(new Set(cloned.nodes.map((entry) => entry.split('/')[0])).size, 1);
+  assert.equal(new Set(cloned.nodes.map((entry) => entry.split('/')[1])).size, 2);
+  assert.equal(cloned.assetCount, 1);
+  assert.equal(cloned.bytes, 'clip-bytes'.length);
+  // 负例：MIME 指向未知资产（跨草稿）→ 放弃 MIME 走常规路径，不造悬空引用。
+  await page.evaluate(() => {
+    const root = document.querySelector('[data-testid=editor]');
+    const transfer = new DataTransfer();
+    transfer.setData('application/x-betterharness-composer-attachment', JSON.stringify([{ assetId: 'missing-asset' }]));
+    root.dispatchEvent(new ClipboardEvent('paste', { clipboardData: transfer, bubbles: true, cancelable: true }));
+  });
+  await page.waitForTimeout(300);
+  assert.equal(await page.evaluate(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.document.value.root.children[0].children
+    .filter((node) => node.type === 'composer-attachment').length), 2);
+});
+
+test('B31: image card alt text and send-as-file toggle persist across reload and ride the submission', async (t) => {
+  const { page, scope } = await openPage(t, { editor: 'rich' });
+  await editorOf(page).click();
+  await page.getByTestId('files').setInputFiles({ name: '猫.png', mimeType: 'image/png', buffer: Buffer.from('cat-bytes') });
+  await page.waitForFunction(() => {
+    const view = window.composerTest.engine.getSnapshot();
+    return !view.dirty && view.state.draft.snapshot.attachments.length === 1;
+  });
+  await page.getByTestId('attachment-alt').fill('一只猫');
+  await page.getByTestId('attachment-send-as-file').click();
+  await page.waitForFunction(() => {
+    const view = window.composerTest.engine.getSnapshot();
+    const attachment = view.state.draft.snapshot.attachments[0];
+    return attachment.alt === '一只猫' && attachment.sendAsFile === true && !view.dirty;
+  });
+  // 刷新：元数据随草稿快照持久化，卡片控件回填。
+  await page.reload(); await page.waitForFunction(() => Boolean(window.composerTest));
+  await page.waitForFunction(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.attachments.length === 1);
+  assert.equal(await page.getByTestId('attachment-alt').inputValue(), '一只猫');
+  assert.equal(await page.getByTestId('attachment-send-as-file').getAttribute('aria-pressed'), 'true');
+  // 提交：载荷携带元数据。
+  await page.getByTestId('scenario').selectOption('normal');
+  await page.getByTestId('send').click();
+  await waitStatus(page, 'accepted');
+  const sent = (await messages(page, scope))[0].snapshot;
+  assert.equal(sent.attachments[0].alt, '一只猫');
+  assert.equal(sent.attachments[0].sendAsFile, true);
+});
+
+test('B32: queued rows get per-item recall — full snapshot returns to the draft and the row turns cancelled', async (t) => {
+  const { page, scope } = await openPage(t);
+  // 排队来源与 B08 同构：A 接纳后其轮次仍在运行，busy-mode=queue 下的新提交保持 queued
+  //（sending 期间的提交按设计是 no-op，不会排队——见 FM01）。
+  await send(page, 'A'); await waitStatus(page, 'accepted');
+  await send(page, '第二条');
+  await waitStatus(page, 'queued', 1);
+  assert.deepEqual((await rowsOf(page)).map((row) => row.status), ['accepted', 'queued']);
+  const recall = () => page.locator('[data-testid=outbox] li[data-status=queued]').getByRole('button', { name: '取回编辑' });
+  // 草稿非空时禁用：取回是整体替换，不覆盖未保存输入。
+  await type(page, '占用草稿');
+  assert.equal(await recall().isDisabled(), true);
+  await editorOf(page).fill('');
+  await page.waitForFunction(() => window.composerTest.engine.getSnapshot().state.draft.snapshot.text === '');
+  assert.equal(await recall().isEnabled(), true);
+  // 取回：整条快照（含附件字节）回到草稿，行状态转 cancelled；在途的 A 不受影响。
+  await recall().click();
+  await page.waitForFunction(() => {
+    const view = window.composerTest.engine.getSnapshot();
+    return view.state.draft.snapshot.text === '第二条' && !view.dirty;
+  });
+  await waitStatus(page, 'cancelled', 1);
+  assert.deepEqual((await rowsOf(page)).map((row) => row.status), ['accepted', 'cancelled']);
+  // 结束轮次：只有 A 送达；被取回的 B 以 cancelled 终态留在本地，永不投递。
+  await page.getByTestId('end-turn').click();
+  await page.waitForFunction(async () => {
+    const view = window.composerTest.engine.getSnapshot();
+    const done = view.state.submissions[1]?.status === 'cancelled'
+      && !view.state.activeTurn
+      && !view.dirty;
+    if (!done) return false;
+    const stats = await (await fetch('api/stats')).json();
+    return stats.messages.length === 1;
+  });
+  assert.deepEqual((await messages(page, scope)).map((message) => message.snapshot.text), ['A']);
+});

@@ -10,7 +10,7 @@ import {
   $createParagraphNode, $createRangeSelection, $createTextNode, $getRoot, $getSelection, $getNearestNodeFromDOMNode,
   $isElementNode, $isRangeSelection,
   $isTextNode, $setSelection, DecoratorNode, TextNode, KEY_ENTER_COMMAND, KEY_ARROW_UP_COMMAND, KEY_ARROW_DOWN_COMMAND,
-  KEY_ESCAPE_COMMAND, PASTE_COMMAND, COMMAND_PRIORITY_HIGH, CLEAR_HISTORY_COMMAND, HISTORIC_TAG,
+  KEY_ESCAPE_COMMAND, PASTE_COMMAND, COPY_COMMAND, CUT_COMMAND, COMMAND_PRIORITY_HIGH, CLEAR_HISTORY_COMMAND, HISTORIC_TAG,
   type SerializedTextNode, type SerializedLexicalNode, type LexicalNode, type RangeSelection, type ElementNode,
   type LexicalEditor as LexicalEditorInstance, type EditorState,
 } from "lexical";
@@ -23,6 +23,31 @@ import { ImeTracker, decideEnter } from "./key-decision.ts";
 import { CompletionSession, detectTrigger, type AcceptedPick } from "./completion.ts";
 import { CandidateMenu } from "./CandidateMenu.tsx";
 import { useComposerSubmission } from "./useComposerSubmission.ts";
+
+/**
+ * 附件节点复制/粘贴的私有剪贴板 MIME（Element 同款思路）：
+ * 复制时把选中附件节点的 AssetId 列表写进剪贴板，粘贴时优先识别——同草稿内
+ * 粘贴 = 新节点引用同一资产（字节零拷贝，attachments 列表不变）；资产不在当前
+ * 草稿（跨草稿粘贴或已移除）时放弃 MIME 走常规路径，绝不凭 MIME 造悬空引用。
+ */
+export const COMPOSER_CLIPBOARD_MIME = "application/x-betterharness-composer-attachment";
+
+/** 解析剪贴板 MIME 载荷：[{ assetId: string }] 形状（与 COPY/CUT 写入方一致）；坏形状返回空数组。 */
+function parseAttachmentClipboard(raw: string): AssetId[] {
+  try {
+    const value: unknown = JSON.parse(raw);
+    if (!Array.isArray(value)) return [];
+    const ids: string[] = [];
+    for (const entry of value) {
+      if (entry !== null && typeof entry === "object" && typeof (entry as { assetId?: unknown }).assetId === "string") {
+        ids.push((entry as { assetId: string }).assetId);
+      }
+    }
+    return ids as AssetId[];
+  } catch {
+    return [];
+  }
+}
 
 type SerializedMention = SerializedTextNode & { referenceId: string };
 /** 附件节点的序列化形态：只承载身份（NodeId + AssetId），字节与元数据都在附件条目上。 */
@@ -111,6 +136,20 @@ export function insertAttachmentNode(
     let paragraph = root.getLastChild();
     if (!paragraph) { paragraph = $createParagraphNode(); root.append(paragraph); }
     (paragraph as LexicalNode & { append(...nodes: LexicalNode[]): unknown }).append(node);
+  });
+}
+
+/**
+ * 把多个附件节点按顺序插到当前选区：一次 editor.update = 一步撤销（剪贴板粘贴路径用）。
+ * 每个节点拿到全新 NodeId（文档内 NodeId 必须唯一），assetId 由调用方保证已存在本草稿——
+ * 同一资产因此可以被多个节点引用（复制附件卡片 = 引用复制，字节不复制）。
+ */
+export function insertAttachmentNodes(editor: LexicalEditorInstance, assetIds: readonly AssetId[]): void {
+  if (!assetIds.length) return;
+  editor.update(() => {
+    const selection = $getSelection();
+    if (!$isRangeSelection(selection)) return;
+    selection.insertNodes(assetIds.map((assetId) => new ComposerAttachmentNode(assetId, newNodeId())));
   });
 }
 
@@ -505,6 +544,28 @@ function Integration({ engine, registerAttachmentInserter, registerAttachmentMov
     });
   }, [editor]);
 
+  // 复制/剪切附件节点：往剪贴板追加私有 MIME（AssetId 列表，见 COMPOSER_CLIPBOARD_MIME）。
+  // 只加料不消费：返回 false 让 Lexical 的默认复制/剪切（HTML、纯文本、剪切删除）照常进行；
+  // 选区里没有附件节点时不写 MIME（空串会误触发粘贴分支，也让普通文本复制保持纯净）。
+  useEffect(() => {
+    const onClipboard = (event: ClipboardEvent | null): boolean => {
+      if (!event || !event.clipboardData) return false;
+      const entries = editor.getEditorState().read(() => {
+        const selection = $getSelection();
+        if (!$isRangeSelection(selection)) return [];
+        return selection.getNodes()
+          .filter((node): node is ComposerAttachmentNode => node instanceof ComposerAttachmentNode)
+          .map((node) => ({ assetId: node.__assetId }));
+      });
+      if (!entries.length) return false;
+      event.clipboardData.setData(COMPOSER_CLIPBOARD_MIME, JSON.stringify(entries));
+      return false;
+    };
+    const copy = editor.registerCommand(COPY_COMMAND, onClipboard, COMMAND_PRIORITY_HIGH);
+    const cut = editor.registerCommand(CUT_COMMAND, onClipboard, COMMAND_PRIORITY_HIGH);
+    return () => { copy(); cut(); };
+  }, [editor]);
+
   // 粘贴（DSH PASTE_COMMAND 同款）：在事件处理器内同步读 clipboardData——await 之后剪贴板即失效。
   // 路由用 splitClipboard 判定：无文件时返回 false 交给 Lexical 默认粘贴（纯文本路径不变）；
   // 有文件时 preventDefault 并统一准入（候选菜单开着也一样——粘贴不经过菜单会话，
@@ -518,6 +579,19 @@ function Integration({ engine, registerAttachmentInserter, registerAttachmentMov
       // 只有真剪贴板事件带 clipboardData，其余交给 Lexical 默认处理。
       if (!(event instanceof ClipboardEvent) || !event.clipboardData) return false;
       const dataTransfer = event.clipboardData;
+      // 私有 MIME 优先于文件/文本路由（Element 同款）：同草稿粘贴附件卡片 = 新节点引用
+      // 同一资产，一步撤销、字节零拷贝、attachments 列表不动。资产必须已在本草稿快照；
+      // 跨草稿或资产已移除时放弃 MIME 走常规路径，绝不造悬空引用。
+      const mime = dataTransfer.getData(COMPOSER_CLIPBOARD_MIME);
+      if (mime) {
+        const assetIds = parseAttachmentClipboard(mime);
+        const known = new Set(engine.getSnapshot().state.draft.snapshot.attachments.map((asset) => asset.id));
+        if (assetIds.length > 0 && assetIds.every((assetId) => known.has(assetId))) {
+          event.preventDefault();
+          insertAttachmentNodes(editor, assetIds);
+          return true;
+        }
+      }
       const items = [...dataTransfer.items];
       const split = splitClipboard(items);
       if (!split.hasFiles) return false;
@@ -534,7 +608,7 @@ function Integration({ engine, registerAttachmentInserter, registerAttachmentMov
       intake?.(batch, text ? () => insertPlainText(editor, text) : undefined);
       return true;
     }, COMMAND_PRIORITY_HIGH);
-  }, [editor, intake]);
+  }, [editor, engine, intake]);
 
   useLayoutEffect(() => {
     editor.setEditable(!view.admitting && !view.closed);

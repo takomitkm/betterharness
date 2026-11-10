@@ -16,6 +16,13 @@ export interface Attachment {
   mediaType: string;
   /** Immutable bytes, persisted by IndexedDB. An object URL is never a durable file reference. */
   data: Blob;
+  /** 图片可选替代文本（无障碍）：随快照持久化并进入发送载荷；文件卡无此概念。 */
+  alt?: string;
+  /**
+   * 图片可选发送模式：true = 原图按文件发送（不压缩），缺省 = 常规图片。
+   * 组件只存储并持久化该标志（卡片切换呈现），压缩/原样编码由宿主发送管线消费——不伪造上传行为。
+   */
+  sendAsFile?: boolean;
 }
 
 /** 附件条目（以 AssetId 为键的 AssetMeta）：Blob 字节始终留在 JS 侧，从不进入 document.value。 */
