@@ -52,6 +52,13 @@ name = "composer-reorder"
 version = "0.1.0"
 
 [[package]]
+name = "composer-runtime"
+version = "0.1.0"
+dependencies = [
+ "composer-core",
+]
+
+[[package]]
 name = "composer-snapshot"
 version = "0.1.0"
 dependencies = [
