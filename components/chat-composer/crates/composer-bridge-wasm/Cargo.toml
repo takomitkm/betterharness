@@ -1,0 +1,17 @@
+[package]
+name = "composer-bridge-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "=0.2.100"
+js-sys = "0.3"
+serde_json.workspace = true
+composer-bridge-protocol = { path = "../composer-bridge-protocol" }
+composer-core = { path = "../composer-core" }
+composer-runtime = { path = "../composer-runtime" }
