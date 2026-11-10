@@ -1,6 +1,6 @@
 # betterharness 组件计划书：Cordis 哲学 × Rust 平台
 
-> 本文是 components/ 下所有组件的总计划书（2026-11-11 第二次修订：**Cordis 设计思想放到架构中心**，不再只是 TS 插件加载器）。
+> 本文是 components/ 下所有组件的总计划书（2026-11-11 第二次修订：**Cordis 设计思想放到架构中心**；第三次修订：**产品线定案——React + Lexical 产品 UI + 双 Host**，见 §9）。
 > 许可证：仓库已切换为 **GPL v3**（2051fdd），本目录全部组件按同一许可证发布。
 
 结论先行：
@@ -75,9 +75,11 @@ Base Profile → Bundle A → Bundle B → Profile Patch → User Patch → CLI 
 
 | 组合 | 优点 | 缺点 |
 | --- | --- | --- |
-| **Dioxus + Rust 自实现 Cordis 模型**（选定） | 全 Rust、类型统一、运行时统一 | 需要自己实现插件机制 |
-| Dioxus + 原版 TS Cordis | 可用现有 Cordis 插件生态 | 双语言双运行时桥接 |
+| **Dioxus + Rust 自实现 Cordis 模型**（核心层选定） | 全 Rust、类型统一、运行时统一 | 需要自己实现插件机制 |
+| Dioxus + 原版 TS Cordis | 可用 Cordis 插件生态 | 双语言双运行时桥接 |
 | TS UI + Cordis + Rust Core | 生态成熟 | 主体不是 Rust-first |
+
+第三次修订的落点：**核心层维持第一种**（Rust 自实现 Cordis，已落地 94 测试）；**UI 适配层采用第三种**——React + Lexical 作为产品线 Provider（复活 archive/ts 资产，见 §9），Dioxus app-web 保留为实验线。主体仍 Rust-first：业务核心、插件体系、运行时全部 Rust，UI 只做适配。
 
 **不要重新发明 Cordis 的全部设计，复用它的设计思想：**
 
@@ -187,13 +189,29 @@ Dioxus Native（WGPU 独立渲染）仍标注实验性，不当成必须依赖�
 
 **Durable/Live 对应**：outbox 与回执 = Session Events（持久事实，进 Storage）；泵送/派发/超时 = Agent Events（运行时事件，Live）。runtime 的事件/效果协议（Event 进 / Effect 出）就是这条边界。
 
-## 9. 施工状态
+## 9. 产品线定案（2026-11-11 第三次修订）
 
-- 计划书（本文，第二次修订）。
-- archive/{ts,rust}：旧实现封存。
-- composer-core / composer-{keynav,completion,intake,reorder,snapshot}：细组件已落地（78 项测试绿）。
-- composer-plugin-api：cordis 式服务容器（Context/Service/apply）→ 本次重做加入 **Fiber 响应式激活、可逆副作用、Typed Event Bus、Capability Seam**。
-- composer-composition：单层 load 清单 → 本次重做为 **Profile + Bundle + Patch 分层**（稳定 ID 替换）。
-- composer-runtime：事件/效果引擎（事件/效果协议 = Durable/Live 边界）。
-- app-web：Dioxus 面板（wasm32 编译验证过），接 runtime 真引擎待做。
-- WASM Components 外部插件宿主（WIT/Wasmtime）：下一步，协议先以 trait 定形。
+**一个 Rust Core、一个 Composer Protocol、一个 React + Lexical 产品 UI、两个 Host。Dioxus 保留实验线。**
+
+- **产品 UI = React + Lexical**（适配层，不是核心）：Lexical 是唯一被真机锤过的富文本编辑器——我们实测抓出的三个深坑（isMoveForward 掩码不派发 Ctrl+Shift+方向键、内部选区滞后于 DOM 选区、editorState.read 不设活动编辑器）连同 B01–B32 浏览器测试一起封存在 archive/ts，复活即复用，不换编辑器重踩。原则 5 不受影响：不让 UI 框架**侵入业务核心**——React 是适配层 Provider，Cordis 核心与 Capability Runtime 不动。
+- **一个 Bridge 协议**：Rust Protocol DTO（serde + ts-rs 导出 TS 类型）+ wasm-bindgen（Web）与 Tauri 2 IPC（Desktop）共用同一语义。Bridge 是协议不是函数包装：原子订阅（订阅即返回基准 revision，防初始化竞态）、Dispatch 串行定序、Effect 幂等回执、dispose 语义，全部要测。
+- **两个 Host**：Web = composer-runtime 编译 WASM（wasm-bindgen）；Desktop = Tauri 2 后端直接跑 Native Rust Core。同一事件序列跨 Host 对拍（conformance tests）是核心质量门；不许为统一接口让 Desktop 强制跑 WASM。
+- **状态边界铁律**：Lexical 的 DOM 选区 / IME composition / 编辑器内部 Selection 是编辑器交互事实源，Rust 快照不得反向覆盖编辑器 DOM（严禁每次收到 Snapshot 重置 Lexical、严禁 IME 未完成时强制同步）——这条纪律与 archive/ts 的 composer-sync 握手、DOM 选区事实源一脉相承。
+- **WASM 兼容性 = Go/No-Go 门**：archive/rust 的 wasm 经验不代表新 runtime 通过验证，composer-runtime 必须独立过 `cargo check --target wasm32-unknown-unknown`（先查 Fiber/EventBus 的 Mutex/TypeId 边界）。
+
+完整实施计划（Phase 0–7、资产保护清单、非目标、Definition of Done）：[`chat-composer/PRODUCT-LINE-PLAN.md`](chat-composer/PRODUCT-LINE-PLAN.md)。
+
+首要交付链路：**Lexical 输入 → React Provider → Composer Bridge → Rust Runtime → Submit → Outbox Snapshot → UI 更新**，先在 Web WASM 真实跑通，再接 Desktop Native。
+
+## 10. 施工状态
+
+- 计划书（本文，第三次修订）+ 实施计划（PRODUCT-LINE-PLAN.md）。
+- archive/{ts,rust}：旧实现封存（ts 侧 React+Lexical 资产待产品线复活）。
+- composer-core / composer-{keynav,completion,intake,reorder,snapshot}：细组件已落地。
+- composer-plugin-api：**Cordis 式 Composition Runtime**——Context 服务容器（trait 对象能力接缝）、Loader+Fiber 生命周期（依赖缺席挂起等待、能力恢复自动激活、级联回滚）、Scope 可逆副作用（LIFO Disposer）、Typed Event Bus（Live）。诚实缺席语义：激活闭包 FnOnce 一次性，级联回滚 = Retired 终态 + 宿主重新 mount，不伪造可重放。
+- composer-composition：**Profile + Bundle + Patch 分层**（replace 稳定 ID 换 Provider、disable 禁用保留装载、层叠顺序覆盖）。
+- composer-runtime：事件/效果引擎（Event 进 / Effect 出，顺序即契约），FM 系列 11 项对拍测试移植全绿。
+- 门禁：cargo test --workspace **94/94 绿** + release 构建 + app-web wasm32 编译验证（main=2cbed4c）。
+- 产品线（app-react + Bridge + 双 Host）：按 PRODUCT-LINE-PLAN.md 执行，Phase 0 资产勘察与 WASM 兼容性门先行。
+- app-web（Dioxus 实验线）：保留，接 runtime 真引擎待做（回环传输暂留）。
+- WASM Components 外部插件宿主（WIT/Wasmtime）：产品线之后，协议已以 trait 定形。
