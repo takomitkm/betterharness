@@ -1,195 +1,199 @@
-# betterharness 组件计划书：Rust-first 模块化架构
+# betterharness 组件计划书：Cordis 哲学 × Rust 平台
 
-> 本文是 components/ 下所有组件的总计划书（2026-11-11 定案）。
+> 本文是 components/ 下所有组件的总计划书（2026-11-11 第二次修订：**Cordis 设计思想放到架构中心**，不再只是 TS 插件加载器）。
 > 许可证：仓库已切换为 **GPL v3**（2051fdd），本目录全部组件按同一许可证发布。
-> 结论先行：**不必为了插件生态坚持 TypeScript。以 Rust 为主语言，Dioxus 作为统一 UI 框架，WASM 作为跨平台插件和隔离执行格式。** 这样整个项目的类型系统、数据结构、组件接口更加统一。
->
-> 核心追求从来不是 TS，而是三个能力：
->
-> 1. 组件可以细粒度拆分和复用。
-> 2. 用户可以通过插件重新组合、替换甚至创造功能。
-> 3. 同一套实现可以运行在不同操作系统和设备上。
->
-> 这三个目标都可以用 Rust 实现。
 
-旧实现（TypeScript 版 chat-composer 与其 Rust 参考核心）已整体归档到
-[`chat-composer/archive/`](chat-composer/archive/)，语义与测试记录随之封存；
-新实现按本计划书在 [`chat-composer/`](chat-composer/) 重建。
+结论先行：
 
-## 1. Dioxus 承担什么
+- **Cordis 是插件运行时和服务协作框架；Rust + WASM 是跨语言、跨运行环境的组件执行方案。它们不是竞争关系，可以组合。**
+- Cordis 真正解决的，是之前方案最薄弱的一环：**动态组合之后，怎样可靠地管理依赖、状态和生命周期。**
+- 不预设 TypeScript 是插件主体，也不预设所有插件必须是 WASM；采用 Rust 重实现 Cordis 模型（Dioxus + Rust 自实现），保留 Context、Service、Inject、Fiber、Reversible Effects 核心模型。
 
-Dioxus 0.7 的平台实现需要特别区分：一份 Rust UI 组件代码适配多平台，而不是所有平台都运行同一个 WASM 文件。
+核心追求的三个能力，Cordis + Rust 组合全部覆盖：
 
-| 平台      | 编译方式        | 渲染方式       |
-| ------- | ----------- | ---------- |
-| Web     | Rust → WASM | 浏览器 DOM    |
-| Windows | Rust 原生二进制  | 系统 WebView |
-| Linux   | Rust 原生二进制  | 系统 WebView |
-| macOS   | Rust 原生二进制  | 系统 WebView |
-| Android | Rust 原生二进制  | 系统 WebView |
-| iOS     | Rust 原生二进制  | 系统 WebView |
+1. 组件可以细粒度拆分和复用。
+2. 用户可以通过插件重新组合、替换、卸载，**而且不需要改动核心程序**。
+3. 同一套实现可以运行在不同操作系统和设备上。
 
-Dioxus Native 还有基于 WGPU 的独立渲染路线，但目前官方仍将其标注为**实验性**——不要把实验性 Native Renderer 当成必须依赖。
+## 1. Cordis 真正优秀的地方
 
-## 2. Dioxus 的一个重要限制：动态插件
+不只是普通依赖注入容器。值得借鉴的机制：
 
-Dioxus 的组件是 Rust 函数组件，通过 `rsx!` 宏在编译期形成组件结构。它擅长静态组合和响应式更新，但**不自带**运行期从外部加载新 Rust 组件并插入组件树的插件系统——障碍包括 Rust ABI、组件类型、生命周期与运行时状态管理。
+| 机制 | 作用 | 对本项目的价值 |
+| --- | --- | --- |
+| Context | 提供统一的服务访问环境 | 降低组件之间的直接依赖 |
+| Service | 声明和提供能力 | 实现细粒度组件替换 |
+| inject | 声明服务依赖 | 自动处理依赖关系 |
+| Fiber | 管理插件实例生命周期 | 动态安装、卸载、重新加载 |
+| Typed Events | 类型化事件通信 | 解耦组件之间的协作 |
+| Disposable Effects | 自动回收注册产生的副作用 | 防止热卸载后的残留 |
+| Loader | 加载和管理插件 | 动态组合系统 |
 
-因此提供两种插件方式：
+### 两个特别值得注意的机制
 
-### A. 内置 Rust 插件（性能最好）
+**第一：依赖响应式激活。** 插件 A 依赖服务 B（`inject: [service B]`）时：B 不存在，A 不崩溃，处于等待状态；B 出现，A 自动激活；B 被替换或移除，A 的相关实例回滚；新的 B 出现，再重新激活（Koishi 官方文档明确描述）。
 
-插件本身就是 Rust crate，编译期链接进应用，可以直接使用 Dioxus 组件：
+**第二：可逆副作用。** 插件注册的事件监听器、命令、定时任务、服务、UI 扩展，卸载时统一回收；直接通过外部 API 创建的资源（如自行启动的服务器）仍需插件自带清理逻辑。
 
-```rust
-pub fn register(registry: &mut Registry) {
-    registry.register_view("message.markdown", MarkdownView);
-    registry.register_command("copy", copy_message);
-}
-```
+这两个机制结合，插件就能真正动态改变一个运行中的系统，而不只是启动时加载几个扩展包。
 
-- 优点：原生类型安全、性能好、可直接写 Dioxus 组件。
-- 缺点：新增插件通常需要重新构建或更新应用。
+## 2. DSH 为什么比普通插件系统更值得研究
 
-### B. 外部 WASM 插件（适合第三方生态）
+DSH（fcc0ad4）不只是用 Cordis 加载插件，而是**把整个产品设计成插件组合**：模型适配器、工具注册中心、会话日志、Agent 接口与 Agent Loop、System Prompt 组装、存储与执行策略——没有一个需要随意修改的特权核心，每个能力都可以通过配置替换。其扩展系统（packages/extensions）还实现了 cordis-host-runner / cordis-client-runner 双半动态插件与沙箱生命周期。
 
-第三方用 Rust 编写插件，编译为 WASM，运行时由插件 Host 加载：
+### A. Capability Seam：能力接缝（最值得借鉴）
+
+一个能力分三个角色：
 
 ```
-app
- ├── Dioxus UI
- ├── Rust Runtime
- └── WASM Plugin Host
-       ├── plugin-a.wasm
-       ├── plugin-b.wasm
-       └── plugin-c.wasm
+Service Definition   定义能力接口，例如 ShellExecutor
+Provider A           本地 Shell
+Provider B           沙箱 Shell
+Consumer             使用 ShellExecutor，不关心具体实现
 ```
 
-研究方向：**WebAssembly Component Model + WIT 接口描述语言**（定义跨语言组件接口、资源与能力边界），**Wasmtime**（Rust 侧的 WASM 执行环境）。
+原本 `shell::execute(command)` 的直接调用，变成 `executor.execute(command)`——用本地执行器、容器执行器还是远程执行器，由配置决定。不改 Agent、不改工具调用逻辑，直接替换执行环境。这正适合细粒度、可替换、通用化内核的追求。
 
-注意：浏览器与原生宿主的 WASM 加载环境不同，不能假设同一个插件包不经过适配就能在所有宿主运行。
+### B. Profile + Bundle + Patch：分层组合
 
-## 3. 插件不直接操纵 UI，而是贡献 UI 描述和行为（最值得采用的设计）
-
-插件想给每条消息加一个按钮，不必向 Dioxus 注入 Rust 函数组件，而是注册**贡献（contribution）**：
-
-```yaml
-plugin:
-  id: message-tools
-
-contributions:
-  commands:
-    - id: rewrite
-      handler: rewrite_message
-
-  ui:
-    - slot: message.toolbar
-      component: button
-      label: Rewrite
-      action: rewrite
-```
-
-主程序提供组件注册表，PluginSlot 按注册信息构造相应组件：
+用户在不修改上游源码的情况下改变整个系统：
 
 ```
-Dioxus UI
-  └── MessageView
-        └── MessageToolbar
-              ├── CopyButton
-              ├── RegenerateButton
-              └── PluginSlot
-                    └── RewriteButton
+Base Profile → Bundle A → Bundle B → Profile Patch → User Patch → CLI Override
 ```
 
-由此实现：
+后续层通过**稳定 ID** 替换已有配置项，也可以新增配置项。比单纯插件注册更强：不只允许添加功能，还允许**重新决定系统由什么功能组成**（例如换掉 storage / text-parser / agent-loop 的具体实现，而不必 fork 整个项目）。
 
-- 插件新增界面元素；
-- 插件替换允许覆盖的界面元素；
-- 插件改变事件处理逻辑；
-- 插件把多个底层组件重新组织成新功能；
-- 插件定义自己的命令和工作流。
+### C. Durable Events 与 Live Events 分离
 
-特别复杂的插件 UI 再提供独立的 UI 扩展接口，不把所有能力限制成按钮、文本和菜单。
+- **Session Events（持久事实）**：用户消息、模型输出、工具执行结果——进入可恢复的会话日志；
+- **Agent Events（运行时事件）**：Agent 开始一步、请求工具、继续执行——用于实时协作和拦截。
+
+避免把事件总线误当成数据库，也避免插件卸载后丢失重要会话记录。
+
+## 3. Cordis 和 Dioxus 怎样结合
+
+| 组合 | 优点 | 缺点 |
+| --- | --- | --- |
+| **Dioxus + Rust 自实现 Cordis 模型**（选定） | 全 Rust、类型统一、运行时统一 | 需要自己实现插件机制 |
+| Dioxus + 原版 TS Cordis | 可用现有 Cordis 插件生态 | 双语言双运行时桥接 |
+| TS UI + Cordis + Rust Core | 生态成熟 | 主体不是 Rust-first |
+
+**不要重新发明 Cordis 的全部设计，复用它的设计思想：**
+
+| Cordis 概念 | Rust 体系对应设计 |
+| --- | --- |
+| Context | Service Context |
+| Service | Trait / Capability Interface |
+| inject | Dependency Resolver |
+| Fiber | Plugin Instance / Lifecycle |
+| Disposable Effects | RAII / Cancellation / Disposer |
+| Typed Events | Typed Event Bus |
+| Loader | Plugin Loader |
+| Bundle | Component Bundle |
+| Profile | Runtime Profile |
+| Patch | Composition Overlay |
+
+用 Rust 的 RAII、所有权和取消机制管理插件资源；外部 WASM 插件通过稳定的跨语言接口调用 Rust 能力。
 
 ## 4. 最终架构
 
 ```
-Rust-first Modular Architecture
+Cordis-inspired Rust Platform
 
 ┌─────────────────────────────────────────────┐
-│ Dioxus Presentation Layer                    │
-│ Chat / Editor / Windows / Panels / Components │
+│ Dioxus UI                                    │
+│ Chat / Editor / Views / Layout / UI Slots    │
 ├─────────────────────────────────────────────┤
-│ Composition Engine                            │
-│ Component Registry / Slots / Hooks / DAG /    │
-│ Workflow —— 负责功能重组和依赖解析              │
+│ Composition Runtime                          │
+│ Context / Services / Dependency Resolver /   │
+│ Fiber / Event Bus —— Cordis 式生命周期        │
 ├──────────────────────┬──────────────────────┤
-│ Built-in Plugins      │ External Plugins      │
-│ Rust Crates（直接链接）│ WASM Modules（隔离运行）│
+│ Native Plugins        │ Dynamic Plugins       │
+│ Rust Crates           │ WASM Components       │
 ├──────────────────────┴──────────────────────┤
-│ Shared Rust Core                              │
-│ State / Scheduler / Text Engine /             │
-│ Message Engine / Editor Engine / Storage      │
+│ Capability Runtime                           │
+│ Chat / Agent / Editor / Storage / Network /  │
+│ Model / Search —— 每个能力都有                │
+│ Definition / Provider / Consumer             │
 ├─────────────────────────────────────────────┤
-│ Platform Adapters                             │
-│ Web / Windows / Linux / macOS / Android / iOS │
+│ Platform Adapters                            │
+│ Web / Windows / Linux / macOS / Android / iOS│
 └─────────────────────────────────────────────┘
 ```
 
+**分离规则**：插件管理、功能组合、UI 组件注册、能力实现必须是不同概念。插件可以同时提供一个搜索服务和一个 UI 面板，但不意味着两者绑定——UI 可以换，搜索引擎也可以换。避免插件越写越大，最后变成不可拆解的功能包。
+
 ### 三种自定义层次
 
-| 层次     | 实现形式             | 是否需要重新编译主程序 |
-| ------ | ---------------- | ----------- |
-| 组件重组   | TOML / RON / DSL | 不需要         |
-| 业务插件   | Rust → WASM      | 不需要         |
-| 深度原生扩展 | Rust crate       | 通常需要        |
-
-RON（Rusty Object Notation）对 Rust 类型和枚举结构的表达比较自然，值得优先考虑。
-
-## 5. UI 框架候选对照（保留参照，不早定死渲染路线）
-
-| 框架 | 定位 | 结论 |
+| 层次 | 实现形式 | 是否需要重新编译主程序 |
 | --- | --- | --- |
-| [Dioxus](https://dioxuslabs.com) | React 式组件模型，Rust 开发，Web/桌面/移动统一 | **当前首选候选** |
-| [Slint](https://slint.dev) | 声明式 UI，桌面/移动/Web/嵌入式，注意评估许可证 | 资源受限场景的备选 |
-| [GPUI](https://github.com/zed-industries/zed)（Zed） | 桌面高性能 UI，值得研究复杂编辑器、文本布局、高交互性能 | 研究参照，不为它放弃统一多平台架构 |
+| 组件重组 | Profile / Bundle / Patch（TOML/RON） | 不需要 |
+| 业务插件 | Rust → WASM Components | 不需要 |
+| 深度原生扩展 | Rust crate | 通常需要 |
 
-**不要过早定死 Dioxus WebView vs Dioxus Native 的渲染路线。** 对话界面与编辑器都值得先做性能原型，重点测：输入延迟、中文 IME、流式 Markdown、长文档虚拟化、滚动性能、插件开销。
+## 5. Cordis 的边界
 
-## 6. 三个已定的架构决策
+| 问题 | Cordis 是否解决 |
+| --- | --- |
+| 插件依赖关系 | 解决 |
+| 插件动态卸载 | 解决 |
+| 生命周期管理 | 解决 |
+| 服务动态替换 | 解决 |
+| 插件配置重组 | 解决 |
+| 原生代码安全隔离 | 不解决 |
+| 跨语言 ABI | 不解决 |
+| 跨平台编译 | 不解决 |
+| 高频计算性能 | 不负责 |
 
-- 主语言：Rust
-- UI 框架：Dioxus
-- 跨平台插件：WASM
-- 组件组合：Rust Composition Engine + 声明式 DSL
-- 原生执行：Rust Native Runtime
-- Web 执行：Rust WASM Runtime
+Koishi 的大量插件实践验证了 Cordis 的**架构模式**，不代表 Koishi 插件能直接装在 DSH 或本项目的宿主上——它们依赖不同的服务接口和宿主能力。
 
-当前研究重点已经从「Rust 和 TS 怎么胶合」变成**「如何设计一套与 UI 框架无关的 Rust 组件协议与插件 ABI」**——协议做好后，将来把 Dioxus 换成 GPUI、Slint 或其他框架，核心组件、工作流和插件都不必推倒重写。
+## 6. 五条原则
 
-## 7. chat-composer：旧实现的功能搬迁矩阵
+1. 借鉴 **Cordis**：一切能力都通过插件、服务和依赖关系组织。
+2. 借鉴 **DSH**：一切系统配置都可以通过 Profile、Bundle、Patch 重组。
+3. 借鉴 **Rust**：用 Trait、生命周期和 RAII 保证核心组件可靠性。
+4. 借鉴 **WASM Component Model**：定义跨语言、跨平台的动态插件接口。
+5. 采用 **Dioxus**：负责跨平台 UI，不让 UI 框架侵入业务核心。
 
-旧 TS 实现（archive/ts，门禁 76 单元 + 34 浏览器 + 14 变异全绿）已实现的功能，在新 Rust 实现中的落点：
+值得优先阅读：DSH 官方架构文档；Koishi Cordis 服务与依赖；Koishi Cordis 生命周期；DSH 插件模型与 Capability Seam。
 
-| 已实现功能 | 旧位置（archive/ts） | 新位置（chat-composer/crates） |
+## 7. Dioxus 平台矩阵（渲染路线不早定死）
+
+| 平台 | 编译方式 | 渲染方式 |
 | --- | --- | --- |
-| 可靠提交：持久 outbox、unknown 永不自动重发、回执只结算自己的消息、queue/steer/none、逐条取回 | core.ts + core-rs/state.rs | `composer-core`（吸收 core-rs 台账，补齐 core.ts 语义） |
-| Enter/IME 仲裁（组合保护 + 10ms 优雅窗 + 菜单/重复/提交优先级） | key-decision.ts | `composer-rules`（keynav 模块） |
-| @// 候选菜单（触发检测、代次防过期、一次选择一次撤销） | completion.ts | `composer-rules`（completion 模块） |
-| 统一文件准入（整批/逐文件策略、粘贴路由） | intake.ts | `composer-rules`（intake 模块） |
-| 正文附件插入/前后移动/一步撤销（移动跨度） | reorder.ts + LexicalEditor | `composer-rules`（reorder 模块）+ UI 层 |
-| 有序文档与附件身份校验 | snapshots.ts | `composer-rules`（snapshot 模块） |
-| 附件卡片（alt 替代文本、压缩/原图开关、MIME 引用克隆） | AttachmentCards.tsx + LexicalEditor | 内置插件 `plugin-attachment-tools`（示范插件贡献机制） |
-| 可见队列 dock | ChatComposer.tsx outbox | `app-web`（Dioxus 面板） |
-| 富文本编辑器（Lexical）与 DOM 粘贴/拖放 | LexicalEditor.tsx | `app-web` 平台适配层（Web 用 DOM；富文本能力随平台演进，见 §5 性能原型） |
-| IndexedDB CAS 持久化 / HTTP 回执 | store.ts / http-transport.ts | `composer-core` 的 Storage/Transport trait + 平台适配实现 |
+| Web | Rust → WASM | 浏览器 DOM |
+| Windows / Linux / macOS | Rust 原生二进制 | 系统 WebView |
+| Android / iOS | Rust 原生二进制 | 系统 WebView |
 
-旧实现的完整行为契约与测试清单见 [`chat-composer/archive/ts/README.md`](chat-composer/archive/ts/README.md)。
+Dioxus Native（WGPU 独立渲染）仍标注实验性，不当成必须依赖。对话界面与编辑器先做性能原型：输入延迟、中文 IME、流式 Markdown、长文档虚拟化、滚动性能、插件开销。GPUI（Zed）作为编辑器交互研究参照，Slint 作为资源受限场景备选。
 
-## 8. 本次施工范围
+## 8. chat-composer：旧实现的功能搬迁矩阵
 
-- 计划书（本文）。
-- 旧实现归档（archive/ts、archive/rust）。
-- 新 Rust workspace：composer-core + 细规则 crates + plugin-api + composition + 内置插件 attachment-tools，全部带原生测试。
-- Dioxus web 演示面板：接线已实现功能的核心状态（草稿、发送、队列、卡片、菜单仲裁）。
-- WASM 外部插件宿主（Wasmtime/WIT）为下一步，不在本次范围；plugin-api 先以 trait 定接口，避免协议返工。
+旧 TS 实现（archive/ts，76 单元 + 34 浏览器 + 14 变异全绿）已实现功能的落点：
+
+| 已实现功能 | 旧位置（archive/ts） | 新位置 |
+| --- | --- | --- |
+| 可靠提交：持久 outbox、unknown 永不自动重发、queue/steer/none、逐条取回 | core.ts + core-rs | `composer-core`（台账）+ `composer-runtime`（事件/效果协议） |
+| Enter/IME 仲裁 | key-decision.ts | `composer-keynav` |
+| @// 候选菜单 | completion.ts | `composer-completion` + 来源注册服务（≈ registerSource） |
+| 统一文件准入 | intake.ts | `composer-intake` |
+| 正文附件插入/移动/撤销 | reorder.ts + LexicalEditor | `composer-reorder` + UI 层 |
+| 有序文档与身份校验 | snapshots.ts | `composer-snapshot` |
+| 附件卡片（alt/压缩原图/MIME 克隆） | AttachmentCards.tsx | 内置插件 attachment-tools（槽位贡献） |
+| 可见队列 dock | ChatComposer.tsx | app-web（Dioxus 面板） |
+| 富文本与粘贴/拖放 | LexicalEditor.tsx | app-web 平台适配层 |
+| IndexedDB CAS / HTTP 回执 | store.ts / http-transport.ts | Storage/Transport 能力接缝（Definition/Provider/Consumer） |
+
+**Durable/Live 对应**：outbox 与回执 = Session Events（持久事实，进 Storage）；泵送/派发/超时 = Agent Events（运行时事件，Live）。runtime 的事件/效果协议（Event 进 / Effect 出）就是这条边界。
+
+## 9. 施工状态
+
+- 计划书（本文，第二次修订）。
+- archive/{ts,rust}：旧实现封存。
+- composer-core / composer-{keynav,completion,intake,reorder,snapshot}：细组件已落地（78 项测试绿）。
+- composer-plugin-api：cordis 式服务容器（Context/Service/apply）→ 本次重做加入 **Fiber 响应式激活、可逆副作用、Typed Event Bus、Capability Seam**。
+- composer-composition：单层 load 清单 → 本次重做为 **Profile + Bundle + Patch 分层**（稳定 ID 替换）。
+- composer-runtime：事件/效果引擎（事件/效果协议 = Durable/Live 边界）。
+- app-web：Dioxus 面板（wasm32 编译验证过），接 runtime 真引擎待做。
+- WASM Components 外部插件宿主（WIT/Wasmtime）：下一步，协议先以 trait 定形。
