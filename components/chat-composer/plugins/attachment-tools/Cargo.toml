@@ -1,0 +1,11 @@
+[package]
+name = "attachment-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+composer-plugin-api = { path = "../../crates/composer-plugin-api" }
+composer-reorder = { path = "../../crates/composer-reorder" }
+serde_json.workspace = true

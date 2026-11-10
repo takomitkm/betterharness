@@ -1,0 +1,15 @@
+[package]
+name = "app-web"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+
+# 独立 workspace：Dioxus 的依赖树不进主 workspace 的门禁（主门禁 = cargo test --workspace）。
+# Web 构建校验：cargo check --target wasm32-unknown-unknown（本目录内执行）。
+[workspace]
+
+[dependencies]
+dioxus = { version = "0.7", features = ["web"] }
+composer-core = { path = "../crates/composer-core" }
+composer-keynav = { path = "../crates/composer-keynav" }
