@@ -2,7 +2,8 @@ import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { ChatComposer, TextareaEditor, type CompletionProvider, type EditorProps } from "./ChatComposer.tsx";
 import { LexicalEditor } from "./LexicalEditor.tsx";
-import { createComposer } from "./core.ts";
+import { createComposer, type EngineFace } from "./core.ts";
+import { createWasmEngine } from "./src/composer/WasmEngine.ts";
 import { IndexedDbComposerStore } from "./store.ts";
 import { createHttpTransport } from "./http-transport.ts";
 import { useComposerSubmission } from "./useComposerSubmission.ts";
@@ -67,15 +68,22 @@ const instrumented: ComposerStore = {
     return store.compareAndSwap(scope, revision, next);
   },
 };
-const engine = await createComposer({
-  scopeId, store: instrumented, transport: createHttpTransport(new URL("./", location.href).href, () => scenario),
-  sendTimeoutMs: Number(parameters.get("timeout") ?? 1500),
-});
+// engine=wasm 走真实 Rust Core WASM（PRODUCT-LINE-PLAN Phase 3 首要链路）；
+// 默认 TS 引擎承载 B 系列全量测试（受控 Adapter，见 WasmEngine/README 的范围说明）。
+const engine = parameters.get("wasm") === "1"
+  ? await createWasmEngine({
+      scopeId, store: instrumented, transport: createHttpTransport(new URL("./", location.href).href, () => scenario),
+      sendTimeoutMs: Number(parameters.get("timeout") ?? 1500),
+    })
+  : await createComposer({
+      scopeId, store: instrumented, transport: createHttpTransport(new URL("./", location.href).href, () => scenario),
+      sendTimeoutMs: Number(parameters.get("timeout") ?? 1500),
+    });
 
 // This bridge exists in the demo only; browser tests inspect real production state and inject boundary faults.
 Object.assign(window, {
   composerTest: {
-    engine, store,
+    engine: engine as unknown as import("./core.ts").ComposerEngine, store,
     failWrite() { writeFailures++; },
     holdWrite() { holdWrite = true; writeGateHit = false; },
     get writeGateHit() { return writeGateHit; },

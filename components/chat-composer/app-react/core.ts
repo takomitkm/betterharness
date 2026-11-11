@@ -419,3 +419,11 @@ export class ComposerEngine {
     this.listeners.clear();
   }
 }
+
+/** 引擎最小面：组件与宿主只依赖这些成员；WasmEngine 等替代实现按形状兼容（结构类型）。 */
+export type EngineFace = Pick<
+  ComposerEngine,
+  | "initialize" | "getSnapshot" | "subscribe" | "idle" | "setBusyMode" | "edit" | "submit"
+  | "handleKey" | "flush" | "query" | "retry" | "restore" | "remove" | "takeLatestQueued"
+  | "beginTurn" | "endTurn" | "resume" | "close"
+>;

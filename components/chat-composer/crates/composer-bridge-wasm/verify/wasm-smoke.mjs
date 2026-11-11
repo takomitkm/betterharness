@@ -20,7 +20,7 @@ const results = [];
 const check = (name, cond, detail) => results.push({ name, pass: Boolean(cond), detail });
 
 // 1. 全新会话：快照 revision 0，protocol_version 1。
-let bridge = new WasmBridge(null);
+let bridge = new WasmBridge("demo/main", null);
 let snap = JSON.parse(bridge.snapshot());
 check('快照带协议版本', snap.protocol_version === 1, snap.protocol_version);
 check('revision 从 0 起', snap.revision === 0, snap.revision);
@@ -74,7 +74,7 @@ check('重复回执 Err UnknownRef（幂等守卫）', duplicateErrored, 'no err
 const persisted = JSON.parse(bridge.snapshot());
 const sendingState = structuredClone(persisted.state);
 sendingState.submissions[0].status = 'sending';
-const restored = new WasmBridge(JSON.stringify(sendingState));
+const restored = new WasmBridge("demo/main", JSON.stringify(sendingState));
 const restoredSnap = JSON.parse(restored.snapshot());
 check('恢复把 sending 转 unknown（FM09）', restoredSnap.state.submissions[0].status === 'uncertain', restoredSnap.state.submissions[0].status);
 

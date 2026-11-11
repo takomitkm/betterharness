@@ -31,10 +31,12 @@ pub struct WasmBridge {
 
 #[wasm_bindgen]
 impl WasmBridge {
-    /// 构造。state_json = Some(持久化的 ScopeState JSON) 恢复；None 全新。
+    /// 构造。scope = 会话身份（回执 receipt.scope 必须与之一致，否则 IdentityMismatch
+    /// → uncertain——宿主配错身份时 FM15 的纪律正确兜底，D004 实录）。
+    /// state_json = Some(持久化的 ScopeState JSON) 恢复（FM09）；None 全新。
     #[wasm_bindgen(constructor)]
-    pub fn new(state_json: Option<String>) -> Result<WasmBridge, JsValue> {
-        let scope = ScopeId::new("demo/main");
+    pub fn new(scope: String, state_json: Option<String>) -> Result<WasmBridge, JsValue> {
+        let scope = ScopeId::new(scope);
         let config = RuntimeConfig {
             scope: scope.clone(),
             send_timeout_ms: 1500,

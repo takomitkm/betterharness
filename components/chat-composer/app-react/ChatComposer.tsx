@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
-import type { ComposerEngine } from "./core.ts";
+import type { EngineFace } from "./core.ts";
 import { copy, documentAttachmentNodes, documentWithoutAttachment, hasContent, isEmptyDraft, newAssetId } from "./snapshots.ts";
 import { ImeTracker, decideEnter } from "./key-decision.ts";
 import { useComposerSubmission } from "./useComposerSubmission.ts";
@@ -18,7 +18,7 @@ export interface IntakeFile {
 }
 
 export interface EditorProps {
-  engine: ComposerEngine;
+  engine: EngineFace;
   placeholder?: string;
   /**
    * 富文本编辑器（Lexical）挂载后注册「在当前光标处插入附件节点」的入口，卸载时以 null 注销。
@@ -114,7 +114,7 @@ const statusLabels = {
 
 /** The host provides a durable engine and optionally a rich editor. There is no implicit-success transport. */
 export function ChatComposer({ engine, Editor = TextareaEditor, placeholder = "写下一条消息…", completionProvider, intakePolicy }: {
-  engine: ComposerEngine; Editor?: ComponentType<EditorProps>; placeholder?: string; completionProvider?: CompletionProvider;
+  engine: EngineFace; Editor?: ComponentType<EditorProps>; placeholder?: string; completionProvider?: CompletionProvider;
   /** 统一文件准入策略（选择器/粘贴/拖放共用）；缺省 = 不限制。 */
   intakePolicy?: IntakePolicy;
 }) {

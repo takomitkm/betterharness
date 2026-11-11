@@ -94,9 +94,12 @@ export async function startDemoServer({ port = 0, journalDirectory } = {}) {
         ['/', ['index.html', 'text/html; charset=utf-8']],
         ['/demo.js', ['demo.js', 'text/javascript; charset=utf-8']],
         ['/demo.js.map', ['demo.js.map', 'application/json']],
+        // 真实 Rust Core WASM（wasm=1 时由 WasmEngine 动态加载；MIME 必须正确，否则编译实例化被拒）。
+        ['/wasm/composer_bridge_wasm.js', ['vendor/composer_bridge_wasm.js', 'text/javascript; charset=utf-8']],
+        ['/wasm/composer_bridge_wasm_bg.wasm', ['vendor/composer_bridge_wasm_bg.wasm', 'application/wasm']],
       ]);
       const file = files.get(url.pathname);
-      if (request.method !== 'GET' || !file) return json(response, { error: 'Not found' }, 404);
+      if (request.method !== 'GET' || !file) { console.log('[server] 404:', request.method, url.pathname); return json(response, { error: 'Not found' }, 404); }
       response.writeHead(200, { 'Content-Type': file[1], 'Cache-Control': 'no-store' });
       response.end(await readFile(join(publicDirectory, file[0])));
     } catch (error) {
