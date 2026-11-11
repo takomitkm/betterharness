@@ -1,24 +1,33 @@
-// 静态服务（Web WASM MIME 必须正确）+ index.html 模板。
+// 静态服务：递归服务指定目录下所有文件（正确的 MIME 映射）。
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { join } from "node:path";
+import { join, extname } from "node:path";
+
+const MIME = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".wasm": "application/wasm",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json",
+  ".ts": "text/javascript; charset=utf-8",
+  ".d.ts": "application/json",
+};
 
 export function startStaticServer(root, port = 0) {
-  const files = new Map([
-    ["/", ["index.html", "text/html; charset=utf-8"]],
-    ["/index.html", ["index.html", "text/html; charset=utf-8"]],
-    ["/app_web.js", ["app_web.js", "text/javascript; charset=utf-8"]],
-    ["/app_web.js.map", ["app_web.js.map", "application/json"]],
-    ["/app_web_bg.wasm", ["app_web_bg.wasm", "application/wasm"]],
-    ["/island.js", ["island.js", "text/javascript; charset=utf-8"]],
-  ]);
   const server = createServer(async (request, response) => {
-    const entry = files.get(new URL(request.url, "http://x").pathname);
-    if (!entry) { response.writeHead(404); response.end("nf"); return; }
     try {
-      response.writeHead(200, { "Content-Type": entry[1] });
-      response.end(await readFile(join(root, entry[0])));
-    } catch { response.writeHead(404); response.end("nf"); }
+      const pathname = new URL(request.url, "http://x").pathname;
+      const filePath = join(root, pathname === "/" ? "index.html" : pathname);
+      const data = await readFile(filePath);
+      const ext = extname(filePath);
+      const mime = MIME[ext] ?? "application/octet-stream";
+      response.writeHead(200, { "Content-Type": mime });
+      response.end(data);
+    } catch {
+      response.writeHead(404);
+      response.end("not found");
+    }
   });
   return new Promise((resolve) => {
     server.listen(port, "127.0.0.1", () => resolve({
