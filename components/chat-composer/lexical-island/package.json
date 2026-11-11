@@ -1,0 +1,22 @@
+{
+  "name": "@betterharness/lexical-island",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "test": "node --test --test-reporter=spec tests/*.test.ts",
+    "build": "node build.mjs",
+    "check": "node --experimental-strip-types --check src/create-controller.ts"
+  },
+  "dependencies": {
+    "lexical": "0.36.2",
+    "@lexical/plain-text": "0.36.2",
+    "@lexical/history": "0.36.2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "playwright-core": "^1.49.0",
+    "@types/node": "^24.0.0"
+  }
+}
