@@ -1,888 +1,1102 @@
-# BetterHarness Composer 产品线恢复与双 Host 架构实施计划
+# BetterHarness Product Line Plan A+
+# Dioxus-first Rust UI + Lexical Editor Island + Rust Core
 
-> 编者注（2026-11-11 收编）：本文为可直接交给代码 Agent 的实施计划，按原文保留。
-> 两处事实修正：基线 `main=2cbed4c` 核实无误；浏览器测试实际为 **B01–B32（34 项）**
-> （文中"B20–B34"按原文保留，执行时以 verify/demo-playwright.mjs 实际清单为准）；
-> "composer-runtime 已有 94 项测试"指 workspace 总数（runtime 本体 11 项 FM 对拍）。
+> 编者注（2026-11-12 收编）：本文正式取代原「React + Lexical 产品线恢复与双 Host」计划
+> （v1，git 历史 4fc2b58 可查；React 线按本文 1.2 转为参考实现与测试基准，不再扩大）。
+> 决策链：D005（乙/甲对比）→ D006（采纳 Plan A+ 为产品方向，门控渐进）→ 本文（A+ 正式执行计划）。
+> 执行状态快照见文首编者注与 `docs/goal-log/`。
 
-下面这份可以直接交给代码 Agent。它不是从零重写 Composer 的方案，而是以 `main=2cbed4c` 所描述的工程状态为基线，复活已有 React + Lexical 资产、建立统一 Bridge、实现 Web WASM 和 Desktop Native 双 Host。
-
-我特别加入了几个必须先验证的风险点：新 Rust Core 是否真的能编译为 WASM、现有 Effect 生命周期如何映射、订阅与快照如何避免竞态，以及 Lexical 的 DOM/IME 状态不能被 Rust 快照反向覆盖。
-
-# BetterHarness Composer 产品线恢复与双 Host 架构实施计划
-
-**项目目标：** 在不修改现有 Rust 业务核心、不丢失 Dioxus 实验线的前提下，恢复 React + Lexical Composer 产品线，建立统一的 Composer Bridge，并分别接入 Web WASM Host 和 Tauri 2 Desktop Native Host。
-
-**工程基线：** `main=2cbed4c`（开始实施前必须核实当前 HEAD；如已变化，以实际工作树为准）。
-
-**实施原则：**
-
-1. Rust Core 是唯一业务逻辑源。
-2. React + Lexical 是产品 UI，不承担核心业务状态机职责。
-3. Web 与 Desktop 使用同一套 Bridge 语义和协议 DTO。
-4. Web 使用 Rust WASM，Desktop 直接调用 Rust Native Core。
-5. Dioxus `app-web` 保留为实验和架构验证线，不删除、不强制迁移。
-6. `archive/ts` 是需要重新启用的历史资产，不是废弃代码。
-7. 不为了增加 Rust 代码占比而牺牲已经验证过的编辑器行为。
+**状态：** Proposed / Implementation Plan
+**产品方向：** Dioxus-first
+**工程基线：** 以 Agent 开始执行时的实际 Git HEAD 和工作树为准
+**决策依据：** D005 及本次新增的 Plan A+ 方案
+**主要目标：** 将 Dioxus `app-web` 从架构验证应用升级为产品 UI，复用已验证的 Lexical 编辑器能力，最终形成 Rust 主导的 Web / Desktop 应用。
 
 ---
 
-# 一、目标架构
+# 0. 执行摘要
 
-## 1.1 总体结构
+## 0.1 最终决策
+
+产品 UI 采用 Dioxus 0.7。
+
+编辑器采用 Lexical Vanilla JS，独立封装为编辑器组件，不依赖 React。
+
+业务逻辑继续由 Rust Core 承担。
+
+Web 和 Desktop 分别运行同一套 Rust Core：
+
+- Web：Dioxus Web + Rust WASM Core。
+- Desktop：Dioxus Desktop + Native Rust Core。
+
+最终目标结构：
 
 ```
-                    BetterHarness Composer
-                              |
-                              |
-                   React + TypeScript UI
-                              |
-                     Lexical Editor
-                              |
-                   Composer React Provider
-                              |
-                    Composer Bridge API
-                              |
-                Shared Protocol / DTO Types
-                              |
-              +---------------+---------------+
-              |                               |
-          Web Host                       Desktop Host
-              |                               |
-        wasm-bindgen                     Tauri 2 IPC
-              |                               |
-         WASM Runtime                    Native Runtime
-              |                               |
-              +---------------+---------------+
-                              |
-                     composer-runtime
-                              |
-                       composer-core
-                              |
-                  Rust Plugin / Composition
+                    BetterHarness
+                         |
+                  Dioxus Application
+                         |
+            +------------+------------+
+            |                         |
+        Rust UI                  Lexical Island
+            |                      Vanilla TS
+            |                         |
+            |                     Browser DOM
+            |                         |
+            +------------+------------+
+                         |
+                  Composer Adapter
+                         |
+                 Existing Protocol
+                         |
+                  composer-runtime
+                         |
+                    composer-core
+                         |
+              plugin-api / composition
 ```
 
-逻辑上只有一个 Rust Core。
+这里有三个明确的边界：
 
-物理上有两种运行方式：
+1. Dioxus 负责产品 UI，不再以 React 作为产品前端。
+2. Lexical 只负责浏览器编辑能力，不承担业务状态管理。
+3. Rust Core 是唯一业务逻辑源，所有 Host 均复用同一套业务语义。
 
-- Web：Rust Core 编译为 WASM，由浏览器直接执行。
-- Desktop：Rust Core 作为 Tauri 后端原生 Rust 代码直接执行。
+## 0.2 为什么不继续使用 React + Lexical
 
-两种 Host 不允许分别实现一套业务状态机。
+计划乙已经证明 React + Lexical 可以工作，但用户希望产品本身由 Rust 主导。
 
-## 1.2 各层职责
+因此不再继续扩大 React 产品线，而是提取 Lexical 的框架无关部分：
 
-| 层             | 技术                                | 职责                          |
-| ------------- | --------------------------------- | --------------------------- |
-| Composer UI   | React + TypeScript                | 组件、布局、主题、交互                 |
-| 编辑器           | Lexical                           | 输入、选区、富文本、IME、撤销、剪贴板        |
-| UI Provider   | React Context / Hooks             | UI 状态订阅、组件生命周期、Bridge 注入    |
-| Bridge        | Rust Protocol DTO + TypeScript 类型 | 统一事件、快照、Effect、错误协议         |
-| Web Host      | wasm-bindgen                      | 调用 WASM Core，管理监听与异步交互      |
-| Desktop Host  | Tauri 2                           | IPC、窗口、原生文件能力、应用生命周期        |
-| Core Runtime  | Rust                              | 事件处理、状态更新、Effect 生命周期       |
-| Core          | Rust                              | 台账、状态模型、业务不变量               |
-| Plugin System | Rust                              | plugin-api、Fiber、可逆副作用      |
-| Composition   | Rust                              | Profile / Bundle / Patch 组合 |
+- 保留 Lexical 编辑器核心。
+- 保留必要的 Lexical Nodes。
+- 保留 History、Clipboard、Key Commands。
+- 保留浏览器行为测试。
+- 移除对 `@lexical/react` 的运行时依赖。
+- Dioxus 接管 Composer 的外围 UI 和交互。
+
+Lexical 官方提供 Vanilla JS 使用路径，其核心和 Extension 可以脱离 React 使用。具体应以当前仓库锁定的 Lexical 版本为准，不能为了使用新版 API 而盲目升级。
+
+## 0.3 Rust 化范围
+
+| 部分                 | 最终实现               |
+| ------------------ | ------------------ |
+| 主应用布局              | Rust / Dioxus      |
+| 会话列表               | Rust / Dioxus      |
+| 消息列表               | Rust / Dioxus      |
+| Composer 外围 UI     | Rust / Dioxus      |
+| 工具栏与菜单             | Rust / Dioxus      |
+| 插件 UI 容器           | Rust / Dioxus      |
+| 核心状态机              | Rust               |
+| 事件与 Effect         | Rust               |
+| Plugin System      | Rust               |
+| 富文本编辑器内核           | Lexical Vanilla JS |
+| 编辑器与 DOM 的交互       | Lexical            |
+| Web / Desktop Host | Rust               |
+
+本计划不是声称整个前端已经 100% Rust。
+
+Lexical 是一个被严格隔离的 JS 子系统。它不允许把 React、JavaScript 业务状态或新的 TS Core 重新引入主应用。
 
 ---
 
-# 二、明确禁止改变的现有资产
+# 一、当前工程基线与迁移保护
 
-在开始开发之前，先建立资产保护清单。
+## 1.1 最近一次已知执行状态
 
-## 2.1 必须保持不变的核心
+根据现有执行报告：
 
-以下部分属于已有业务资产，不在本次重写范围内：
+| 部分               | 最近一次已知状态                                              |
+| ---------------- | ----------------------------------------------------- |
+| composer-core    | 已有 Rust 实现                                            |
+| composer-runtime | 已有 Rust 实现                                            |
+| 规则组件             | keynav / completion / intake / reorder / snapshot 已存在 |
+| Plugin System    | plugin-api / composition 已存在                          |
+| Dioxus           | `app-web` 已有 Dioxus 0.7 实现                            |
+| WASM Core        | 已有真实运行验证                                              |
+| React + Lexical  | 已恢复为可运行参考实现                                           |
+| Bridge           | 7/7 测试通过，BM05 协议形状冻结                                  |
+| CAS              | BM07 `persist_revision` 已测绿                           |
+| Browser E2E      | 真实 WASM Core，10/10                                    |
+| React 浏览器测试      | B01–B32 对应的 34 项用例已恢复实测 34/34                         |
+| 额外测试             | 76 单元测试、14 项变异同步测试已恢复                                 |
+| IDB              | 适配器及 WasmEngine 接线曾处于未测完状态                            |
+| Tauri Host       | 本计划不再采用                                               |
+| Dioxus Desktop   | 尚需实现或验收                                               |
 
-- `composer-core`
-- `composer-runtime`
-- `keynav`
-- `completion`
-- `intake`
-- `reorder`
-- `snapshot`
-- `plugin-api`
-- `composition`
+注意：
 
-当前状态：
+以上是已有报告中的状态，不代表执行本计划时 Git 工作树仍然完全相同。
 
-- composer-runtime 已有 94 项测试。
-- FM 系列 11 项对拍测试已通过。
-- Plugin System 已基于 Rust 实现。
-- Fiber / 可逆副作用机制已经存在。
-- Profile / Bundle / Patch 已经存在。
+Agent 必须重新检查当前 HEAD、提交历史、未提交文件和最新测试结果。
 
-Agent 必须先运行现有测试，记录基线结果。
+## 1.2 必须保留的历史资产
 
-不得为了适配 React 而修改核心状态机语义。
+### Rust Core
 
-不得重新实现一套 TypeScript Core。
+以下 crate 不属于本次重写范围：
 
-不得为了让两种 Host 使用相同调用技术而强制把 Native Core 编译成 WASM。
+- composer-core
+- composer-runtime
+- keynav
+- completion
+- intake
+- reorder
+- snapshot
+- plugin-api
+- composition
 
-不得为了方便直接把 Rust 内部类型全部暴露给 UI。
+### React / Lexical
 
-## 2.2 必须保留的历史资产
+原有 React 实现不再作为产品 UI，但在迁移完成以前必须保留：
 
-`archive/ts`：
+- 原始 React + Lexical 实现。
+- B01–B32 全部 34 项浏览器用例。
+- 76 项单元测试。
+- 14 项变异同步测试。
+- 现有 10 项真实 WASM Core E2E。
+- IME 实验记录。
+- DOM Selection 处理记录。
+- 剪贴板 MIME 记录。
+- Lexical 历史 Bug 修复和回归测试。
 
-- React UI。
-- Lexical Editor。
-- 原有组件实现。
-- 浏览器行为测试。
-- B20–B34 测试与问题记录。
-- IME、选区、撤销、快捷键、剪贴板等踩坑记录。
+迁移完成以前，React 实现是对照组。
 
-`archive/rust`：
+不得提前删除。
 
-- wasm-bindgen 导出相关实现。
-- 23 项 Node 冒烟测试。
-- 旧实现中的可复用绑定经验。
+### Dioxus
 
-注意：旧版实现只能作为参考，必须逐项核对新 Runtime 的类型和语义。不能因为旧版本通过了 Node 测试，就认为新 Runtime 已经具备 WASM 兼容性。
+现有 `app-web` 作为主产品线的起点。
 
-`app-web`：
+优先在现有目录里升级，不要未经检查就新建一个重复的 `app-dioxus`。
 
-- 保留 Dioxus 0.7。
-- 保留现有 WASM 编译验证。
-- 保留台账真实状态接入。
-- 暂时不删除现有回环传输。
-- 后续可以用来验证统一协议是否真正与 UI 框架无关。
+### 未提交修改
+
+开始工作时必须检查：
+
+```
+git status --short --branch
+git log --oneline -20
+git diff
+git diff --cached
+```
+
+特别检查：
+
+- `persist_revision`
+- BM07 测试
+- IndexedDB 适配器
+- WasmEngine 接线
+- Dioxus `app-web` 当前状态
+- `PRODUCT-LINE-PLAN.md`
+- D005 决策记录
+
+禁止：
+
+- `git reset --hard`
+- `git clean -fd`
+- 覆盖未提交文件
+- 未检查就执行大规模 cherry-pick
+- 将尚未验证的 IDB 代码标记为完成
+- 擅自删除 React 参考实现
+
+必须先生成迁移前工作树快照报告。
+
+## 1.3 决策记录
+
+保留原有 D005，不修改历史决策的原始内容。
+
+新增一条决策记录，例如：
+
+`docs/goal-log/decisions/D006-dioxus-first-product-line.md`
+
+具体命名遵循现有仓库规则。
+
+新决策应说明：
+
+- D005 当时选择 React 产品线的依据。
+- 现在为什么调整产品方向。
+- React 已完成的工作如何转化为参考资产。
+- 为什么选择 Dioxus + Lexical Vanilla。
+- 为什么暂时不采用纯 Rust 编辑器。
+- 计划 A+ 与未来纯 Rust 编辑器实验的关系。
+
+如果仓库中的 D005 不是本轮描述的决策内容，以实际文件为准，不得虚构或覆盖记录。
 
 ---
 
-# 三、阶段 0：仓库勘察与基线冻结
+# 二、目标架构
 
-**目标：避免在不了解现有代码的情况下重复造轮子。**
-
-在修改任何代码之前，完成以下工作。
-
-## 3.1 检查仓库
-
-确认：
-
-- Cargo Workspace 结构。
-- 所有 crate 的依赖关系。
-- composer-core 和 composer-runtime 的实际公开 API。
-- Runtime 的事件分发接口。
-- Runtime 的快照生成接口。
-- Runtime 的 Effect 产生和处理机制。
-- Plugin System 的实际生命周期。
-- `app-web` 如何连接 Runtime。
-- `archive/ts` 的完整组件结构。
-- `archive/ts` 中 B20–B34 的测试组织方式。
-- `archive/rust` 中 WASM 导出的实际方式。
-
-输出：
-
-`docs/architecture/composer-asset-inventory.md`
-
-内容包括：
-
-1. 当前 crate 结构。
-2. 依赖关系。
-3. 各层公开 API。
-4. 历史 React/Lexical 组件清单。
-5. 历史浏览器测试清单。
-6. 可以直接复用的代码。
-7. 必须适配的代码。
-8. 无法复用的代码及原因。
-
-## 3.2 运行基线测试
-
-执行：
+## 2.1 产品架构
 
 ```
-cargo test --workspace
+BetterHarness
+│
+├── app-ui
+│   │
+│   ├── shell
+│   ├── navigation
+│   ├── workspace
+│   ├── conversation
+│   ├── message-list
+│   ├── composer
+│   │   ├── ComposerShell
+│   │   ├── LexicalIsland
+│   │   ├── AttachmentLayer
+│   │   ├── CompletionLayer
+│   │   └── Toolbar
+│   │
+│   └── plugin-ui
+│
+├── lexical-island
+│   ├── Lexical Controller
+│   ├── Custom Nodes
+│   ├── History
+│   ├── Clipboard
+│   ├── Commands
+│   └── Browser Tests
+│
+├── composer-adapter
+│   ├── Composer Protocol
+│   ├── Runtime Adapter
+│   ├── Snapshot Subscription
+│   └── Effect Handling
+│
+├── composer-runtime
+├── composer-core
+├── plugin-api
+└── composition
 ```
 
-以及现有 WASM、Node、浏览器测试命令。
-
-记录：
-
-- 测试总数。
-- 通过数。
-- 失败数。
-- 跳过数。
-- WASM 构建结果。
-- 原有测试需要的浏览器和环境。
-
-输出：
-
-`docs/testing/composer-baseline.md`
-
-不得把原本失败的测试悄悄从 CI 中删除。
-
-## 3.3 WASM 兼容性检查
-
-这是第一个技术风险门。
-
-`app-web` 曾经编译为 wasm32，不代表当前 `composer-runtime` 和所有依赖已经支持 wasm32。
-
-必须独立验证：
-
-```
-cargo check -p composer-core --target wasm32-unknown-unknown
-cargo check -p composer-runtime --target wasm32-unknown-unknown
-```
-
-具体 crate 名称以实际 Workspace 为准。
-
-检查：
-
-- 文件系统依赖。
-- 操作系统 API。
-- 线程和同步原语。
-- Tokio 等异步 Runtime 依赖。
-- 动态加载。
-- 插件系统依赖。
-- 时间、随机数、网络等外部能力。
-- 所有第三方 crate 的 WASM 支持情况。
-
-如果失败：
-
-1. 判断是否属于 Core 业务逻辑，还是 Host 能力。
-2. 把浏览器和桌面平台相关能力隔离到 Adapter / Port。
-3. Core 不得直接依赖特定操作系统。
-4. 不得为 WASM 复制一套业务逻辑。
-5. 不得未经评估改用本地 HTTP 服务作为最终 Web 方案。
-
-输出：
-
-`docs/architecture/wasm-compatibility.md`
-
----
-
-# 四、阶段 1：恢复 React + Lexical 产品线
-
-建议新建独立的 `app-react`，但必须先检查仓库现有目录和构建系统，避免与已有应用结构冲突。
-
-## 4.1 恢复 UI
-
-从 `archive/ts` 恢复：
-
-- React 组件。
-- Composer 主界面。
-- Lexical Editor。
-- 输入区域。
-- 快捷键。
-- Completion UI。
-- 附件 UI。
-- 交互状态。
-- 主题和样式。
-- 现有浏览器测试。
-
-不得直接将整个 archive 目录无审查地复制到新目录。
-
-对每个模块标注：
-
-- 直接恢复。
-- 修改 import / 接口后恢复。
-- 需要适配新 Core。
-- 已不再需要。
-
-## 4.2 UI 与 Core 的状态边界
-
-必须区分两类状态。
-
-**Lexical / 浏览器负责的编辑器瞬时状态：**
-
-- DOM 选区。
-- 光标位置。
-- IME composition 状态。
-- 候选输入过程。
-- 编辑器内部 Selection。
-- DOM 焦点。
-- 尚未完成的编辑操作。
-
-**Rust Core 负责的业务状态：**
-
-- Composer 台账。
-- 草稿业务身份。
-- Submit 状态。
-- Outbox。
-- 事件和事务。
-- 附件业务归属。
-- Effect 生命周期。
-- 业务快照。
-
-Lexical 的 DOM 和 Selection 是编辑器交互事实源，不能用 Rust Snapshot 在每次状态更新时反向覆盖整个编辑器。
-
-严禁：
-
-- 每次打字都用 React state 重建整个编辑器。
-- 每次收到 Rust Snapshot 都重置 Lexical 内容。
-- 用 Rust 快照代替浏览器实时 Selection。
-- 在 IME composition 未完成时强制同步或替换编辑器文本。
-
-UI 可以向 Core 发送必要的编辑事件，但必须尊重 Lexical 的输入生命周期。
-
-## 4.3 必须恢复的历史问题测试
-
-以下记录不能丢失：
-
-1. `isMoveForward` 位掩码问题。
-2. Lexical 对 `Ctrl+Shift+方向键` 不派发预期命令的问题。
-3. Lexical 内部 Selection 滞后于 DOM Selection 的问题。
-4. `editorState.read` 不自动设置活动 Editor 的问题。
-5. IME composition 窗口。
-6. 剪贴板 MIME 类型。
-7. 原生拖放与粘贴。
-8. Undo / Redo 行为。
-
-原有 B20–B34 测试应尽量保留原始用例，通过 Adapter 适配新接口。
-
-## 4.4 建立 UI Provider
-
-建议结构：
-
-```
-app-react/
-  src/
-    app/
-    components/
-    composer/
-      ComposerProvider
-      ComposerContext
-      ComposerHooks
-      ComposerSelectors
-      ComposerBridge
-      editor/
-      attachments/
-      completion/
-      keynav/
-    hosts/
-      web/
-      desktop/
-    generated/
-```
-
-具体目录允许根据现有工程调整。
-
-组件只能依赖 Composer Provider / Hooks，不允许直接依赖：
-
-- wasm-bindgen 导出模块。
-- Tauri invoke。
-- Tauri event。
-- Core 内部 Rust 类型。
-
-这样 React 组件本身不需要知道自己运行在 Web 还是 Desktop。
-
-阶段验收：
-
-- React 应用能够独立启动。
-- Lexical 可以正常输入。
-- 原有快捷键测试恢复。
-- 中文 IME 测试通过。
-- 选区与撤销测试通过。
-- UI 尚未接入真实 Core 时可以使用受控测试 Adapter，但不得把 Mock 当成最终实现。
-
----
-
-# 五、阶段 2：设计 Composer Bridge
-
-这是本次改造最重要的基础设施。
-
-Bridge 必须是有明确协议、有错误模型、有版本、有测试的正式边界。
-
-## 5.1 协议类型
-
-建议分离：
-
-```
-composer-core 内部模型
-        |
-        | 映射
-        v
-Composer Protocol DTO
-        |
-        +---- TypeScript 类型
-        |
-        +---- WASM 序列化
-        |
-        +---- Tauri IPC 序列化
-```
-
-不要直接把内部 Rust 结构体当作 UI API。
-
-Protocol DTO 需要明确：
-
-- 事件结构。
-- 快照结构。
-- Effect 请求结构。
-- Effect 回执结构。
-- 错误结构。
-- 版本字段。
-- 必要的标识符。
-
-可使用：
-
-- `serde`：协议序列化。
-- `ts-rs`：导出 TypeScript 类型。
-- `wasm-bindgen`：WASM / JavaScript 调用。
-- 现有工程已经采用的其他序列化方式。
-
-注意：`ts-rs` 和 `wasm-bindgen` 职责不同，不能互相替代。
-
-## 5.2 Bridge 最小接口
-
-建议统一成以下语义：
-
-```
-interface ComposerBridge {
-  getSnapshot(): Promise<ComposerSnapshot>;
-
-  dispatch(
-    event: ComposerEvent
-  ): Promise<DispatchResult>;
-
-  subscribe(
-    listener: (update: ComposerUpdate) => void
-  ): Promise<UnsubscribeHandle>;
-
-  ackEffect(
-    id: EffectId,
-    result: EffectResult
-  ): Promise<AckResult>;
-
-  dispose(): Promise<void>;
-}
-```
-
-这里是协议草案，不要求与现有 Runtime 的函数签名完全一致。Agent 必须优先适配已有 API。
-
-具体职责：
-
-| 方法            | 职责                 |
-| ------------- | ------------------ |
-| `getSnapshot` | 获取完整业务快照           |
-| `dispatch`    | 提交用户事件             |
-| `subscribe`   | 订阅状态和必要的 Effect 更新 |
-| `ackEffect`   | 回传外部 Effect 处理结果   |
-| `dispose`     | 释放当前 Bridge 实例的资源  |
-
-另外，订阅接口必须处理初始化竞态。
-
-推荐语义：
-
-```
-subscribe()
-   |
-   +--> 原子地注册订阅
-   |
-   +--> 返回初始 Snapshot + revision
-   |
-   +--> 推送后续 revision
-```
-
-不能使用：
-
-```
-getSnapshot()
-       |
-       | 中间可能发生状态变化
-       v
-subscribe()
-```
-
-否则 UI 可能永久漏掉两者之间的状态更新。
-
-如果现有 Runtime 已经提供原子订阅机制，直接适配，不要重新实现一套。
-
-## 5.3 事件顺序
-
-每个 Composer Runtime 实例必须有确定的事件顺序。
-
-要求：
-
-- 单实例的 Dispatch 串行处理。
-- 明确定义并发 Dispatch 的排序规则。
-- 必要时增加 `event_id`、`client_seq`、`instance_id`。
-- Snapshot 带单调递增的 `revision`。
-- UI 忽略过期 Snapshot。
-- 不得因 WASM 异步调用、Tauri IPC 或 Promise 调度造成事件乱序。
-
-具体的事件 ID 和序号设计应结合现有 Runtime 实现，不能无意义地重复引入已经存在的标识符。
-
-## 5.4 Effect 生命周期
-
-必须首先理解 composer-runtime 当前的 Effect 语义。
-
-Rust Runtime 已经负责事件和效果处理，不得在 Host 重复执行 Rust 已经执行的副作用。
-
-需要区分：
-
-1. Rust Runtime 内部执行的 Effect。
-2. 必须由 Web Host 执行的浏览器 Effect。
-3. 必须由 Desktop Host 执行的原生 Effect。
-4. 插件自身管理的可逆副作用。
-
-`ackEffect(id, result)` 仅用于确实需要外部执行和回执的 Effect。
-
-要求：
-
-- Effect 有唯一标识。
-- 重复回执不会重复提交事务。
-- 同一 Effect 的冲突回执必须有确定错误行为。
-- 未知或已经结束的 Effect 有确定处理规则。
-- 失败结果能够被 Core 正确识别。
-- 必须保留现有 Fiber / 可逆副作用语义。
-- 不得由 React 自行推断和决定业务补偿逻辑。
-
-## 5.5 Snapshot 一致性
-
-每份 Snapshot 应明确关联 `revision`。
-
-要求：
-
-- revision 单调递增。
-- 订阅初始化时获得基准 revision。
-- 更新通知具备明确的版本。
-- 过期快照不覆盖新状态。
-- 恢复订阅时能够重新获取完整状态。
-- 快照不能包含不应暴露给 UI 的内部资源和运行时对象。
-
-初期优先使用完整 Snapshot，除非性能数据证明需要增量 Snapshot。
-
-## 5.6 Dispose 语义
-
-要区分：
-
-- 取消 UI 订阅。
-- 释放 Bridge 实例。
-- 销毁 Composer Runtime。
-- 处理仍在执行中的 Effect。
-
-不要在 React 组件卸载时意外销毁需要继续工作的业务 Runtime。
-
-必要时提供单独的 `unsubscribe`，`dispose` 只负责销毁当前实例的资源。
-
----
-
-# 六、阶段 3：实现 Web WASM Host
-
-## 6.1 目标
-
-最终 Web 应用不依赖本地 Rust HTTP 服务。
-
-运行结构：
+各部分技术选择：
+
+| 部分      | 技术                      |
+| ------- | ----------------------- |
+| UI      | Dioxus 0.7              |
+| 页面布局    | RSX                     |
+| 样式      | CSS                     |
+| 响应式状态   | Dioxus Signals / Stores |
+| 编辑器     | Lexical Vanilla         |
+| JS 编译   | 现有 Node 工具链             |
+| Core    | Rust                    |
+| Web     | WASM                    |
+| Desktop | Dioxus Desktop          |
+| 桌面窗口后端  | Dioxus Desktop / Wry    |
+| 协议      | 已冻结 Composer Protocol   |
+
+## 2.2 Web 执行路径
 
 ```
 Browser
    |
-React + Lexical
+   +-- Dioxus UI (WASM)
+   |       |
+   |       +-- app-ui
+   |       |
+   |       +-- composer-adapter
+   |       |
+   |       +-- composer-runtime
+   |       |
+   |       +-- composer-core
    |
-Composer Bridge
-   |
-wasm-bindgen
-   |
-composer-runtime.wasm
-   |
-composer-core
+   +-- Lexical JS Bundle
+           |
+           +-- DOM
+           +-- IME
+           +-- Selection
+           +-- Clipboard
 ```
 
-## 6.2 实现内容
+Dioxus 和 Core 如果在同一个 Rust WASM 应用中，可以直接在 Rust 内部调用，不需要把 Core 再导出给 JavaScript。
 
-- 新建 WASM Adapter。
-- 接入 Core Runtime。
-- 导出必要的 Bridge 方法。
-- 导出 Protocol DTO。
-- 实现 Snapshot 订阅。
-- 实现 Dispatch。
-- 实现外部 Effect 回执（仅限 Runtime 确实需要的 Effect）。
-- 实现错误映射。
-- 实现 dispose。
-- 实现初始化和失败恢复。
+Lexical 只通过明确的编辑器接口与 Dioxus 交互。
 
-不要把整个 Rust Core 的内部 API 无差别导出。
+## 2.3 Desktop 执行路径
 
-不要把业务逻辑放进 JavaScript WASM wrapper。
+```
+Desktop Application
+       |
+       +-- Dioxus Desktop UI
+       |       |
+       |       +-- app-ui
+       |       |
+       |       +-- composer-adapter
+       |       |
+       |       +-- composer-runtime (Native)
+       |       |
+       |       +-- composer-core
+       |
+       +-- System WebView
+               |
+               +-- Lexical JS Bundle
+```
 
-## 6.3 异步与性能
+Desktop 不使用 WASM 运行 Core。
 
-初期可以使用最简单、最可靠的调用方式。
+Desktop 也不需要额外增加 Tauri 2 作为第二层壳。
 
-但 Bridge 对 UI 应保持异步接口，避免以后将 Core 移至 Worker 时修改 React 组件。
-
-如有必要，可以将纯 Core 运算移入 Web Worker，但：
-
-- Lexical DOM 必须留在主线程。
-- IME 和 Selection 仍由浏览器负责。
-- Worker 迁移不能改变事件顺序。
-- 不得仅为了技术形式引入 Worker。
-
-## 6.4 WASM 验收
-
-至少验证：
-
-1. WASM 初始化。
-2. Snapshot 获取。
-3. Dispatch。
-4. 事件排序。
-5. Snapshot 更新。
-6. Effect 输出。
-7. Effect 回执。
-8. 重复回执。
-9. dispose。
-10. 初始化失败和错误传播。
-
-最终必须使用真实 Rust Core，不能保留一个只模拟协议的 Mock Host。
+Dioxus Desktop 本身就是基于 WebView 的桌面渲染方案，Rust 代码运行在 Native 环境。
 
 ---
 
-# 七、阶段 4：实现 Tauri 2 Desktop Host
+# 三、Phase 0：迁移前审计和基线冻结
 
-## 7.1 目标
+**目标：先确认当前已有实现，禁止重复实现。**
 
-Desktop 不经过 WASM。
+## 3.1 仓库审计
 
-运行结构：
+检查：
 
-```
-React + Lexical
-      |
-Composer Bridge
-      |
-Tauri IPC
-      |
-Tauri Rust Backend
-      |
-composer-runtime (native)
-      |
-composer-core
-```
+- 当前 Cargo Workspace。
+- 当前 Dioxus `app-web`。
+- 当前 React 产品线。
+- `archive/ts`。
+- `archive/rust`。
+- `PRODUCT-LINE-PLAN.md`。
+- D005。
+- BM05、BM07。
+- 已有桥接 DTO。
+- 现有 IDB 接线。
+- 当前测试脚本。
 
-## 7.2 实现内容
+输出：
 
-- 创建 Tauri 2 Desktop Host。
-- 接入现有 React 构建产物。
-- 将 Native Runtime 注册到 Tauri 应用状态。
-- 为 Composer 实例提供独立 Runtime 生命周期。
-- 实现 Dispatch IPC。
-- 实现 Snapshot / Update 事件推送。
-- 实现必要的 Effect 回执。
-- 实现 dispose。
-- 实现错误序列化。
+`docs/architecture/plan-a-plus-migration-inventory.md`
 
-必须复用 Web Host 的 Protocol DTO 和语义。
+内容：
 
-Tauri IPC 与 WASM 调用方式不同，但 UI 不得感知这种差异。
+1. 当前 Git 提交状态。
+2. 当前工作树状态。
+3. 已交付成果。
+4. 未完成成果。
+5. React 资产列表。
+6. Dioxus 资产列表。
+7. Lexical 组件依赖关系。
+8. Core 公开 API。
+9. Bridge 协议。
+10. 需要迁移的具体接口。
 
-## 7.3 并发与生命周期
-
-必须检查：
-
-- 多个 Composer 实例是否可能并行。
-- 多个窗口是否可能访问同一 Runtime。
-- Runtime 是否要求单线程。
-- 是否需要 Mutex、Actor 或已有事件队列。
-- 是否有异步任务在窗口关闭后仍然运行。
-
-避免：
-
-- 为整个 Runtime 长时间持有 Mutex。
-- 在持锁期间等待外部异步操作。
-- 窗口关闭后丢失尚未完成的业务事务。
-- 两个窗口修改同一实例却没有确定顺序。
-
-## 7.4 平台能力隔离
-
-Tauri Host 可以负责：
-
-- 文件选择。
-- 文件读写。
-- 原生拖放。
-- 应用窗口。
-- 系统通知。
-- 系统剪贴板。
-- 应用生命周期。
-
-但这些能力必须以明确的 Host API 暴露，不应该直接渗透到 Composer UI 或 Core。
-
----
-
-# 八、阶段 5：跨 Host 一致性测试
-
-这是本项目的核心质量门。
-
-不能仅仅证明 Web 和 Desktop 都能编译。
-
-必须证明它们执行同一组事件序列时，得到相同的业务语义。
-
-## 8.1 Bridge Conformance Tests
-
-建立统一测试序列：
-
-```
-初始化 Composer
-       |
-获取 Snapshot
-       |
-输入事件
-       |
-提交 Submit
-       |
-Runtime 处理
-       |
-生成 Effect
-       |
-执行 / 回执
-       |
-Snapshot 更新
-       |
-检查 Outbox
-```
-
-同一测试分别运行：
-
-- Native Rust。
-- WASM Node 环境。
-- 浏览器 Web Host。
-- Tauri Desktop Host（适合的集成测试范围）。
-
-比较：
-
-- Snapshot。
-- revision。
-- Outbox。
-- Effect 请求。
-- Effect 最终状态。
-- 错误结果。
-- 事件处理顺序。
-
-可以用 canonical JSON / golden fixtures 做对拍，但必须排除合法的环境差异字段，例如随机实例 ID 或时间戳。
-
-## 8.2 必测异常场景
-
-- 重复 Dispatch。
-- 重复 Effect 回执。
-- 错误 Effect ID。
-- 并发 Dispatch。
-- 过期 Snapshot。
-- 订阅过程中发生状态更新。
-- 订阅断开后重新连接。
-- UI 卸载。
-- Host 销毁。
-- 处理中发生错误。
-- 多 Composer 实例互不干扰。
-
-## 8.3 Rust 测试
-
-现有 94 项测试和 FM 对拍测试必须保持通过。
-
-增加 Bridge 专属测试，优先使用现有测试工具。
-
-适当增加属性测试，验证：
-
-- revision 单调性。
-- 重复回执幂等性。
-- 事件序列一致性。
-- Dispose 后资源不会继续泄漏。
-- 非法输入不能破坏 Runtime 状态不变量。
-
----
-
-# 九、阶段 6：浏览器和编辑器行为验证
-
-React + Lexical 是产品线，因此不能只做 Rust 单元测试。
-
-## 9.1 恢复 B20–B34
-
-逐项核对 archive 中的测试：
-
-- 原始测试目标。
-- 原始浏览器行为。
-- 对应现有实现。
-- 新适配层是否改变了行为。
-- 是否需要更新测试驱动方式。
-
-不要把原测试删掉再声称通过。
-
-## 9.2 中文 IME
-
-必须覆盖：
-
-- compositionstart。
-- compositionupdate。
-- compositionend。
-- 中文候选词选择。
-- 候选词未完成时按 Enter。
-- Shift + Enter。
-- composition 中的快捷键。
-- 输入过程中收到 Core Snapshot。
-- 输入过程中发生 React 更新。
-- 快速连续输入。
-- 中英文混合。
-- 输入框失焦和恢复焦点。
-
-必须注意：自动化浏览器测试不能完全代替真实操作系统输入法测试。
-
-至少保留实际 Windows 中文输入法的手工验收记录。
-
-## 9.3 Selection 与键盘行为
-
-必须覆盖：
-
-- DOM Selection。
-- Lexical Selection。
-- 方向键移动。
-- Ctrl + 方向键。
-- Ctrl + Shift + 方向键。
-- Home / End。
-- Shift + Home / End。
-- 多段文本选择。
-- 撤销 / 重做。
-- 光标位置在更新后的正确性。
-
-## 9.4 剪贴板与附件
-
-覆盖：
-
-- 纯文本粘贴。
-- HTML 粘贴。
-- 图片粘贴。
-- 文件粘贴。
-- 多 MIME 数据。
-- 拖放文件。
-- 拖放图片。
-- 不支持的 MIME。
-- 大文件。
-- 重复粘贴。
-- 附件上传失败。
-
-文件本体不要默认通过 JSON Base64 在 Bridge 中来回传输。
-
-优先使用平台文件对象或 Host 管理的文件句柄；Protocol 只传递必要元数据和引用。
-
----
-
-# 十、阶段 7：性能与实际使用验收
-
-先记录已有 React + Lexical 的性能基线，再与新方案比较。
+## 3.2 测试基线
 
 至少记录：
 
-| 指标          | 测试内容                       |
-| ----------- | -------------------------- |
-| 输入延迟        | 连续普通文本输入                   |
-| IME 延迟      | 中文 composition             |
-| Submit 延迟   | 提交到 Outbox 可见              |
-| Snapshot 延迟 | Core 更新到 UI 显示             |
-| 渲染耗时        | 大量消息与复杂 Composer           |
-| 长文档性能       | 大量节点、长文本                   |
-| 内存          | WASM / Native Runtime / UI |
-| 初始化         | 首次启动和重复打开                  |
-| 资源释放        | 卸载和重新初始化                   |
+- Workspace Rust 测试。
+- Core 测试。
+- Runtime 测试。
+- FM 对拍测试。
+- BM05 协议测试。
+- BM07 CAS 测试。
+- 76 项单元测试。
+- 14 项变异同步测试。
+- B01–B32 对应的 34 项测试。
+- Node 冒烟测试。
+- 真实 WASM Browser E2E 10/10。
 
-建议先采集基线，再设定性能回归阈值。
+不能把原本通过的测试从 CI 移除后宣称迁移成功。
 
-不得在没有数据的情况下声称 WASM 或 Native 一定更快。
+不能将参考实现测试与新产品线测试混为一谈。
 
-## 10.1 桌面 WebView 矩阵
+## 3.3 工作树保护
 
-Tauri 的系统 WebView 并不统一：
+先处理已验证但尚未提交的代码。
+
+对于 BM07：
+
+- 检查 `persist_revision` 的当前实现。
+- 确认测试通过。
+- 检查是否存在与其他改动混杂的问题。
+- 与未完成 IDB 接线分离。
+- 按照仓库提交规范处理。
+
+对于 IDB：
+
+- 不假定当前代码已经可用。
+- 不覆盖已有实现。
+- 不直接从头重写。
+- 先厘清适配器与 Core 的依赖关系。
+
+Phase 0 完成后，必须有一份可追溯的基线报告。
+
+---
+
+# 四、Phase 1：Lexical Vanilla 化 PoC
+
+**这是全计划最重要的风险验证阶段，必须优先完成。**
+
+目标不是重写 Lexical，而是证明：
+
+原有已经通过测试的 Lexical Composer，能够在不使用 React 的情况下继续提供同样的浏览器编辑能力。
+
+## 4.1 检查 Lexical 版本
+
+首先检查 `archive/ts` 的 package.json 和锁文件。
+
+记录：
+
+- lexical 版本。
+- 所有 `@lexical/*` 包版本。
+- React 版本。
+- 各个 React Plugin。
+- 自定义 Node。
+- 自定义 Command。
+- 自定义 Extension。
+- CSS 依赖。
+- 测试框架。
+
+遵循：
+
+**迁移期间不升级 Lexical。**
+
+Lexical 和 `@lexical/*` 包版本必须一致，避免出现多份 Lexical Core。
+
+只有当当前版本不支持所需的 Vanilla API 时，才允许单独提出升级计划。
+
+新版 Lexical 已经提供 Vanilla JS 和 Extension 使用方式，但迁移应首先依据当前锁定版本的真实 API，而不是直接套用最新版文档。
+
+## 4.2 建立 React Plugin 映射表
+
+逐个审查原来的 React 组件和插件。
+
+| 原实现              | Vanilla 目标                       |
+| ---------------- | -------------------------------- |
+| LexicalComposer  | `createEditor` 或当前版本对应的原生初始化 API |
+| ContentEditable  | 独立的编辑器 DOM Root                  |
+| HistoryPlugin    | 对应版本的 History 注册 API             |
+| OnChangePlugin   | `registerUpdateListener`         |
+| RichTextPlugin   | Lexical 原生节点和扩展                  |
+| KeyCommandPlugin | `registerCommand`                |
+| 自定义 React Plugin | Extension / Command / Listener   |
+| ErrorBoundary    | Lexical `onError` 和外层错误处理        |
+| React Hook       | Controller 内部生命周期管理              |
+
+注意：
+
+以上是迁移方向，不代表每个旧 Plugin 都有一对一替代 API。
+
+必须根据锁定版本的实际源码逐项映射。
+
+## 4.3 建立 Vanilla Controller
+
+建议独立目录：
+
+```
+lexical-island/
+  src/
+    editor/
+      create-controller.ts
+      editor-controller.ts
+      editor-config.ts
+    extensions/
+      history.ts
+      rich-text.ts
+      clipboard.ts
+      keynav.ts
+      completion.ts
+      attachments.ts
+    nodes/
+    commands/
+    protocol/
+    styles/
+  tests/
+```
+
+目录名按现有 Node Workspace 结构调整。
+
+Controller 是唯一管理 Lexical 实例的对象。
+
+参考接口：
+
+```
+interface LexicalController {
+  focus(): void;
+
+  blur(): void;
+
+  clear(): void;
+
+  executeCommand(
+    command: EditorCommand
+  ): void;
+
+  getDocument(): SerializedEditorState;
+
+  getPlainText(): string;
+
+  setDocument(
+    state: SerializedEditorState
+  ): void;
+
+  setDisabled(
+    disabled: boolean
+  ): void;
+
+  destroy(): void;
+}
+```
+
+必须确认每个方法在当前 Lexical 版本中如何正确实现。
+
+特别注意：
+
+- `getDocument()` 必须在合法的 Editor State 读取上下文中执行。
+- 不能假设每次调用都会自动建立活动 Editor。
+- 不得在异步回调中访问已经销毁的 Editor。
+- 不得把内部 DOM Selection 简化成字符串偏移量后再假定可以完整恢复。
+
+## 4.4 编辑器 DOM 所有权
+
+采用隔离的 Editor Island：
+
+```
+Dioxus Component
+    |
+    +-- Editor Container (Dioxus owns)
+            |
+            +-- Lexical Root (Lexical owns)
+                    |
+                    +-- Paragraphs
+                    +-- Text Nodes
+                    +-- Custom Nodes
+                    +-- Selection
+```
+
+规则：
+
+- Dioxus 管理外层容器。
+- Lexical 管理容器内的编辑器 DOM。
+- Dioxus 不得在 Lexical Root 内持续执行 DOM reconciliation。
+- Lexical 不得修改 Dioxus 管理的其他元素。
+- Dioxus 更新状态不能导致编辑器被意外销毁重建。
+- 同一容器不得反复初始化多个 Lexical Editor 实例。
+
+初期不引入 Shadow DOM。
+
+原因是需要最大限度保留已经验证过的 Selection、IME、Clipboard 和 CSS 行为，避免增加新的变量。
+
+## 4.5 对外接口
+
+编辑器对外只提供命令和事件。
+
+例如：
+
+```
+type EditorCommand =
+  | { type: "focus" }
+  | { type: "clear" }
+  | { type: "insert-text"; text: string }
+  | { type: "set-disabled"; value: boolean }
+  | { type: "submit-request" };
+
+type EditorEvent =
+  | { type: "ready"; instanceId: string }
+  | { type: "document-changed"; revision: number }
+  | { type: "submit-request"; document: SerializedEditorState }
+  | { type: "attachment-added"; attachment: AttachmentMetadata }
+  | { type: "error"; message: string };
+```
+
+这些只属于 Editor Island 的接口。
+
+不得修改已经冻结的 Composer Bridge 协议来适应 Lexical。
+
+需要在 Editor Island 协议中增加版本字段和实例 ID，防止多个 Composer 编辑器互相干扰。
+
+编辑器状态变化不意味着每次都要向 Rust Core 发送完整内容。
+
+应当以现有 Core Event 和 Bridge 契约为准。
+
+## 4.6 挂载方式
+
+优先实现：
+
+```
+Dioxus LexicalIsland Component
+       |
+       +-- 创建稳定 DOM 容器
+       |
+       +-- 初始化 Vanilla Controller
+       |
+       +-- 监听 EditorEvent
+       |
+       +-- 转发 EditorCommand
+       |
+       +-- 组件销毁时 destroy()
+```
+
+建议先通过 Dioxus `onmounted` / 生命周期机制和 JS Controller 完成挂载。
+
+Dioxus 0.7 提供 `document::eval` 等 JavaScript 交互能力。Web 和 Desktop 的具体调用方式必须在 PoC 中验证，避免直接把 Web-only 的 `web-sys` 代码放入 Desktop 共用部分。
+
+如果稳定容器和生命周期交互不可靠，再评估 Custom Element。
+
+不允许同时引入多套互相竞争的挂载机制。
+
+## 4.7 PoC 测试
+
+必须完成：
+
+- React 运行时不再参与 Lexical 初始化。
+- 可以创建 Lexical Editor。
+- 可以输入和删除文本。
+- 可以获取序列化状态。
+- 可以清空编辑器。
+- 可以注册和执行 Command。
+- 可以卸载和重新挂载。
+- 不产生重复 Editor 实例。
+- 不发生 DOM 双重管理。
+
+## 4.8 Phase 1 Go / No-Go
+
+必须达到：
+
+- 目标 Lexical 功能完整。
+- 无 React 运行时依赖。
+- 原始 B 系列测试可迁移到 Vanilla Controller。
+- 原有输入、选区和撤销行为没有退化。
+- Dioxus 可以稳定挂载、操作和销毁 Editor Island。
+
+如果不能达到，不允许直接切换到自研编辑器。
+
+先提交问题清单和最小复现。
+
+---
+
+# 五、Phase 2：Dioxus 产品 UI
+
+**目标：让 Dioxus 从架构实验升级为产品主 UI。**
+
+复用现有 `app-web`，避免新建第二套重复界面。
+
+## 5.1 UI 组件结构
+
+建议：
+
+```
+app-ui/
+  src/
+    app/
+    shell/
+    navigation/
+    workspace/
+    conversation/
+    message-list/
+    composer/
+      shell.rs
+      editor_island.rs
+      toolbar.rs
+      attachments.rs
+      completion.rs
+      status.rs
+    panels/
+    plugin_ui/
+    theme/
+```
+
+按照现有代码结构逐步拆分。
+
+不要为了符合目录结构而大规模移动已有代码。
+
+## 5.2 Composer 外围 UI
+
+Composer 除了编辑器本体，全部由 Dioxus 实现：
+
+- 输入区域布局。
+- 工具栏。
+- 发送按钮。
+- 发送状态。
+- 附件列表。
+- 附件移除。
+- 自动补全面板。
+- Slash Command 菜单。
+- 模型选择。
+- Agent 选择。
+- 上下文状态。
+- 插件按钮。
+- 拖放提示。
+- 错误和恢复提示。
+
+Lexical 只管理编辑器内部。
+
+不要把工具栏、模型选择器、发送按钮也塞进 Lexical。
+
+## 5.3 React 退出产品 UI
+
+最终产品不应依赖：
+
+- React DOM。
+- React Runtime。
+- `@lexical/react`。
+- React Context。
+- React Hooks。
+- React 版 Composer Provider。
+
+允许在开发阶段保留：
+
+- React 参考应用。
+- 原有测试驱动。
+- 对照实验。
+- 资产恢复工具。
+
+最终交付时，应当能够通过依赖分析证明产品运行时没有引入 React。
+
+## 5.4 Dioxus 状态管理
+
+区分：
+
+**UI 临时状态：**
+
+- 面板展开。
+- 当前 Tab。
+- Hover。
+- 弹出菜单。
+- 工具栏选中。
+- 窗口布局。
+
+由 Dioxus Signals 管理。
+
+**编辑器状态：**
+
+- Selection。
+- 光标。
+- IME。
+- Undo/Redo。
+- DOM。
+- 输入法候选过程。
+
+由 Lexical 管理。
+
+**业务状态：**
+
+- Draft 身份。
+- Submit。
+- Outbox。
+- Effect。
+- Agent/Plugin 业务状态。
+- 持久化状态。
+
+由 Rust Core 管理。
+
+同一业务状态不得在 Dioxus、Lexical、Core 三处同时维护为可独立写入的权威状态。
+
+---
+
+# 六、Phase 3：Lexical 与 Dioxus 集成
+
+## 6.1 事件流
+
+```
+用户输入
+   |
+   v
+Browser IME / DOM
+   |
+   v
+Lexical Editor
+   |
+   +-- Selection
+   +-- History
+   +-- Custom Nodes
+   +-- Clipboard
+   |
+   v
+EditorEvent
+   |
+   v
+Dioxus LexicalIsland
+   |
+   v
+Dioxus Composer Component
+```
+
+反向调用：
+
+```
+Dioxus UI
+   |
+   v
+EditorCommand
+   |
+   v
+Lexical Controller
+   |
+   v
+Editor API
+```
+
+## 6.2 禁止的数据流
+
+禁止：
+
+```
+Lexical change
+    |
+    v
+Dioxus Signal
+    |
+    v
+重新设置整个 Editor State
+    |
+    v
+重新创建 DOM
+```
+
+禁止在每一轮 Rust Snapshot 到达时重新初始化 Lexical。
+
+禁止在 composition 尚未结束时用外部内容覆盖输入。
+
+禁止将 Dioxus 的文本状态作为 DOM Selection 的事实源。
+
+## 6.3 Submit 流程
+
+实际数据以现有 Composer Protocol 为准，目标行为：
+
+```
+用户输入
+   |
+Lexical Controller
+   |
+Submit Command
+   |
+获取当前有效编辑内容
+   |
+Dioxus 提交事件
+   |
+Rust Composer Adapter
+   |
+composer-runtime
+   |
+Outbox / Accepted
+   |
+Snapshot 更新
+   |
+Dioxus UI
+```
+
+验收必须覆盖：
+
+- 空消息。
+- 普通文本。
+- 富文本。
+- 多段文本。
+- 附件。
+- 快捷键提交。
+- 点击发送。
+- 提交失败。
+- 重复提交。
+- Submit 与 IME composition 冲突。
+
+提交成功以后，编辑器清空、草稿切换或恢复的时机必须由业务流程明确决定。
+
+不得仅仅在点击发送按钮时无条件清空编辑器。
+
+---
+
+# 七、Phase 4：接入现有 Rust Core 和 Bridge
+
+**目标：在不改变现有业务语义的前提下，让 Dioxus 直接使用 Rust Core。**
+
+## 7.1 Bridge 原则
+
+BM05 已冻结的协议形状继续保留。
+
+BM07 CAS 语义继续保留。
+
+不得因为 Dioxus 是 Rust UI，就随意修改事件名称、状态定义、错误类型和 revision 语义。
+
+本次允许增加的内容仅限于：
+
+- Dioxus 侧调用适配。
+- 必需的 Host 生命周期接口。
+- 与 Editor Island 有关的独立接口。
+- 已确认必要的持久化适配。
+
+如果发现协议确实存在缺陷，先提交独立 ADR 和兼容性测试，不得在 UI 迁移中顺手修改。
+
+## 7.2 Dioxus Rust Adapter
+
+Dioxus 与 Core 位于同一个 Rust 应用时，不需要再用 JavaScript 作为 Core 调用中介。
+
+建议建立：
+
+```
+Dioxus Components
+       |
+       v
+Composer Adapter
+       |
+       v
+Existing Composer Protocol
+       |
+       v
+composer-runtime
+       |
+       v
+composer-core
+```
+
+Adapter 可以在内部直接调用 Rust Runtime。
+
+但必须维持现有协议的：
+
+- 事件含义。
+- 事件处理顺序。
+- Snapshot 语义。
+- revision。
+- Effect 处理。
+- 错误映射。
+- 幂等性。
+- CAS 约束。
+
+不要为追求"全程零序列化"而绕开协议测试。
+
+必要时可以在 Rust 内部使用强类型 DTO 直接传递，避免不必要的 JSON 编解码。
+
+## 7.3 React 参考实现
+
+原 React Host 继续作为兼容性参考，直到 Dioxus 完成同等行为验收。
+
+执行：
+
+- 使用同一组输入事件。
+- 使用同一组业务事件。
+- 比较相同的业务结果。
+- 验证 Dioxus 没有引入新的事务语义。
+
+不能要求 Dioxus 必须复用 React 的 JS Bridge 实现。
+
+要求复用的是协议和业务语义，不是同一段调用代码。
+
+## 7.4 Effect 生命周期
+
+必须复用 composer-runtime 当前的 Effect 处理方式。
+
+区分：
+
+1. Core 内部 Effect。
+2. Browser Host Effect。
+3. Desktop Host Effect。
+4. Plugin Effect。
+
+不能让 Dioxus 再实现第二套业务补偿逻辑。
+
+已有 Fiber 和可逆副作用语义必须保持。
+
+## 7.5 Snapshot
+
+继续使用现有 Snapshot 模型。
+
+确保：
+
+- revision 单调递增。
+- 订阅初始化不存在竞态。
+- 过期快照不会覆盖新状态。
+- Dispose 不影响仍然存活的 Runtime。
+- Dioxus 组件重建不会意外创建新的业务 Runtime。
+
+不要在 UI 中复制一份拥有独立写入权的业务台账。
+
+---
+
+# 八、Phase 5：IndexedDB 与持久化
+
+**目标：Web 数据可以真正持久保存，而不是仅在当前运行周期中有效。**
+
+这是计划乙遗留的工作，应独立完成，不要和编辑器迁移混成一个大型改动。
+
+## 8.1 首先审查现有实现
+
+检查：
+
+- `persist_revision`
+- BM07 测试
+- IDB Adapter
+- WasmEngine
+- 当前持久化接口
+- 浏览器数据结构
+- 恢复流程
+
+未完成的 IDB 接线必须单独审查和测试。
+
+不得直接假设它已经实现了原子事务。
+
+## 8.2 持久化职责
+
+Rust Core 定义业务状态和持久化所需的语义。
+
+平台适配器提供具体存储能力：
+
+```
+composer-runtime
+       |
+Persistence Port
+       |
+   +---+----+
+   |        |
+  Web    Desktop
+   |        |
+IndexedDB  Native Storage
+```
+
+Web：
+
+- IndexedDB。
+- 原子事务。
+- CAS / revision。
+- 断电或页面关闭后的恢复。
+- schema version。
+- migration。
+
+Desktop：
+
+- 优先复用已有 Native Storage 方案。
+- 如需 SQLite 或其他存储，单独评估。
+- 不为了与 Web 统一而强迫桌面使用 IndexedDB。
+
+## 8.3 验收
+
+- 刷新浏览器后能够恢复。
+- 浏览器关闭后仍可恢复。
+- 重复提交不会造成重复事务。
+- CAS 冲突可以正确处理。
+- 不完整写入不能被误认为完成。
+- migration 可重复执行。
+- schema 不兼容时有明确错误和恢复路径。
+
+---
+
+# 九、Phase 6：Dioxus Desktop
+
+**目标：在 Web 产品 UI 稳定后，通过 Dioxus Desktop 构建桌面应用。**
+
+本方案不使用 Tauri 2 再包一层。
+
+## 9.1 总体结构
+
+```
+Dioxus Desktop
+      |
+     Wry
+      |
+System WebView
+      |
+Lexical JavaScript
+      |
+Native Rust Application
+      |
+composer-runtime
+      |
+composer-core
+```
+
+UI 组件尽可能共用 `app-ui`。
+
+Desktop 使用 Native Rust Core。
+
+## 9.2 平台差异
+
+Dioxus Desktop 基于系统 WebView，不等于拥有统一的 Chromium 环境。
+
+至少考虑：
 
 | 平台      | WebView   |
 | ------- | --------- |
@@ -890,257 +1104,563 @@ Tauri 的系统 WebView 并不统一：
 | macOS   | WKWebView |
 | Linux   | WebKitGTK |
 
-至少确认目标平台实际可用的构建和测试环境。
+优先完成 Windows 桌面验收。
 
-不要仅因为 Chromium 浏览器测试通过，就认为三个平台的 IME、剪贴板、拖放完全通过。
+之后依次扩展 macOS、Linux。
 
----
+不要默认浏览器 Edge 中通过的输入法测试等于桌面 WebView 中也通过。
 
-# 十一、实施阶段及交付门槛
+## 9.3 原生能力
 
-按以下顺序开发，不要同时大规模修改多个层。
+Desktop Host 负责：
 
-## Phase 0：资产勘察
+- 文件选择。
+- 文件读写。
+- 文件拖放。
+- 系统剪贴板。
+- 窗口生命周期。
+- 系统通知。
+- 托盘。
+- 应用级快捷键。
+- 本地持久化。
 
-交付：
+所有系统能力通过 Rust Host 提供。
 
-- `composer-asset-inventory.md`
-- `composer-baseline.md`
-- `wasm-compatibility.md`
+Lexical 只负责编辑器内部交互。
 
-验收：仓库结构、公开 API、测试和 WASM 兼容性已确认。
+Dioxus Desktop 的 JavaScript 交互需要经过稳定的 JS Adapter，不得把 Web-only `web-sys` API 直接放入 Desktop 共用代码。
 
-## Phase 1：React + Lexical 恢复
+## 9.4 Desktop 验收
 
-交付：
-
-- `app-react`
-- Composer React Provider
-- 恢复的 Lexical 编辑器
-- 恢复的 B20–B34 测试
-
-验收：React + Lexical 可独立运行，IME、选区和撤销行为通过。
-
-## Phase 2：Bridge 协议
-
-交付：
-
-- Protocol DTO。
-- TypeScript 类型生成。
-- ComposerBridge 接口。
-- 事件排序机制。
-- Snapshot 订阅机制。
-- Effect 生命周期映射。
-- Bridge 单元测试。
-
-验收：Bridge 可以在 Mock Adapter 下完整模拟事件和快照，但 Mock 只用于测试。
-
-## Phase 3：Web WASM Host
-
-交付：
-
-- WASM 构建。
-- wasm-bindgen 导出。
-- Web Adapter。
-- 真实 Core 接入。
-- Node / Browser Conformance Tests。
-
-验收：
-
-**真实输入 → Submit → Rust Runtime → Outbox 可见。**
-
-不允许使用假 Core 或本地回环 HTTP 替代最终 WASM Core。
-
-## Phase 4：Tauri Native Host
-
-交付：
-
-- Tauri 2 Desktop 应用。
-- Native Runtime 管理。
-- Tauri IPC Adapter。
-- Snapshot 推送。
-- Effect 回执。
-
-验收：Desktop 不经过 WASM，且通过与 Web 相同的业务协议测试。
-
-## Phase 5：回归与优化
-
-交付：
-
-- Native / WASM 对拍报告。
-- B20–B34 浏览器测试报告。
-- 中文 IME 测试报告。
-- 跨平台 WebView 测试报告。
-- 性能基线与差异报告。
-
-验收：所有已声明的产品能力有实际测试结果，不使用"理论上支持"代替验收。
+- 应用可以正常启动。
+- Lexical 可以挂载。
+- 输入和 IME 工作。
+- 编辑器可以正常销毁。
+- Native Core 能正常工作。
+- 文件选择和附件流程正确。
+- 重启后数据可恢复。
+- 关闭窗口后无任务泄漏。
+- 没有通过 WASM 间接调用 Native Core。
 
 ---
 
-# 十二、目录和代码组织建议
+# 十、Phase 7：浏览器行为和兼容性回归
 
-目录名以现有 Workspace 为准，以下仅作为目标组织方式：
+## 10.1 B 系列恢复
+
+历史测试实际是 B01–B32 编号，对应 34 个测试用例。
+
+必须保留原有编号与原始测试目标。
+
+将测试分成：
+
+- Lexical Controller 单元测试。
+- Vanilla Editor 浏览器测试。
+- Dioxus UI 集成测试。
+- Core / Bridge Conformance 测试。
+
+不要把 React 组件测试机械复制成 Dioxus 测试。
+
+测试真正的行为契约。
+
+## 10.2 中文 IME
+
+必须覆盖：
+
+- `compositionstart`
+- `compositionupdate`
+- `compositionend`
+- 中文候选词输入。
+- 候选词确认。
+- 候选词未确认时 Enter。
+- Shift + Enter。
+- 快速连续输入。
+- 中英文混合输入。
+- composition 期间收到业务 Snapshot。
+- composition 期间 Dioxus 发生重新渲染。
+- 编辑器焦点丢失后恢复。
+- 输入过程中执行快捷键。
+
+自动化测试不能完全替代真实操作系统输入法。
+
+至少保留 Windows 中文输入法手工测试。
+
+建议记录操作系统、WebView、浏览器版本和输入法版本。
+
+## 10.3 Selection
+
+覆盖：
+
+- DOM Selection。
+- Lexical Selection。
+- 方向键。
+- Ctrl + 方向键。
+- Ctrl + Shift + 方向键。
+- Home / End。
+- Shift + Home / End。
+- 多段文本选择。
+- 选区跨节点。
+- 选区恢复。
+- 选区与外部 UI 更新并发。
+
+原有三项已修复的 Lexical 问题必须保留回归测试：
+
+- `isMoveForward` 位掩码问题。
+- 内部 Selection 滞后。
+- `editorState.read` 活动 Editor 上下文问题。
+
+## 10.4 Clipboard
+
+覆盖：
+
+- 纯文本。
+- HTML。
+- 图片。
+- 文件。
+- 多 MIME。
+- 不支持的 MIME。
+- 大文件。
+- 原生拖放。
+- 重复粘贴。
+- 失败恢复。
+
+## 10.5 附件混排
+
+必须使用真实 Lexical Custom Node 或当前版本对应的 Extension 实现。
+
+检查：
+
+- 正文与附件混排。
+- 附件前后光标定位。
+- 删除附件。
+- 复制和粘贴附件。
+- 拖放附件。
+- Undo / Redo。
+- 序列化和反序列化。
+- 提交后的附件归属。
+
+文件二进制不要通过 JSON Base64 反复传输。
+
+优先使用平台文件句柄或 IDB Blob / Native 临时文件，Core 保存稳定的附件业务标识和必要元数据。
+
+---
+
+# 十一、Rust 编辑器路线：保留为未来替换目标
+
+本计划不会永久放弃全 Rust 编辑器。
+
+但不把它放在当前产品交付的关键路径上。
+
+建议独立记录：
+
+`docs/experiments/editor-rs/`
+
+测试目标：
+
+1. 中文 IME。
+2. DOM Selection。
+3. 正文内附件混排。
+4. 撤销栈。
+5. 剪贴板 MIME。
+6. 快捷键。
+7. Undo / Redo。
+8. 可访问性。
+9. 大量文本输入性能。
+10. 长文档性能。
+
+## 11.1 替换 Lexical 的准入条件
+
+Rust 编辑器必须同时满足：
+
+- IME 手工测试通过。
+- Selection 行为通过。
+- 正文内附件混排通过。
+- Undo / Redo 通过。
+- 剪贴板 MIME 测试通过。
+- 与 Lexical 使用相同的编辑器行为测试。
+- 性能达到或超过当前 Lexical 基线。
+- 能在目标 WebView 中稳定运行。
+
+未达到全部条件前，不允许替换产品线 Lexical。
+
+将来替换时，只更换 Editor Adapter，不修改 Rust Core 或 Composer Protocol。
+
+---
+
+# 十二、Plugin System 与 WASM Components
+
+现有 Cordis 式 Rust Plugin System 保持不动。
+
+包括：
+
+- plugin-api
+- Fiber
+- 可逆副作用
+- composition
+- Profile
+- Bundle
+- Patch
+
+不要把 UI 框架迁移和插件运行时重构绑定在一起。
+
+关于 WASM Components：
+
+- 当前 plugin-api 是已有业务插件体系。
+- WASM Component Model 的插件沙箱属于单独的运行时能力。
+- 不得将两者视为同一件事。
+- 不要在 UI 迁移期间引入第二套插件加载机制。
+
+如果原有计划要求最终支持 Component Model，应单独开展兼容性 PoC：
+
+- Component Model 工具链。
+- WIT 接口定义。
+- Native Desktop 执行环境。
+- Web 浏览器执行环境。
+- 插件资源和权限模型。
+- 可逆副作用的映射。
+
+在运行时和安全模型未经测试前，不将它加入 Composer 产品交付依赖。
+
+---
+
+# 十三、实施阶段与验收顺序
+
+| 阶段      | 交付                         | 主要验收                       |
+| ------- | -------------------------- | -------------------------- |
+| Phase 0 | 迁移审计和基线报告                  | 工作树和测试状态明确                 |
+| Phase 1 | Lexical Vanilla Controller | 不依赖 React，原有关键测试通过         |
+| Phase 2 | Dioxus 产品 UI               | 主 UI 由 Rust 实现             |
+| Phase 3 | Dioxus + Lexical 集成        | IME、Selection、Clipboard 通过 |
+| Phase 4 | Rust Core Adapter          | Submit → Outbox Accepted   |
+| Phase 5 | IndexedDB 持久化              | 真持久化、CAS 和恢复通过             |
+| Phase 6 | Dioxus Desktop             | Native Core，系统 WebView 运行  |
+| Phase 7 | 全量回归                       | 跨 Host 行为一致，性能合格           |
+| Future  | Pure Rust Editor           | 满足准入条件后替换 Lexical          |
+
+必须先过 Phase 1，才允许大规模迁移产品 UI。
+
+必须先过 Phase 3，才允许宣称 Dioxus Composer 已达到可用状态。
+
+必须先过 Phase 4，才允许将 Dioxus 主线标记为真实 Core 接入。
+
+---
+
+# 十四、统一测试体系
+
+## 14.1 测试分层
 
 ```
-apps/
-  app-react/
-  app-web/                  # 现有 Dioxus，保留
-  app-desktop/              # Tauri 2 Host
-
-crates/
-  composer-core/
-  composer-runtime/
-  composer-bridge-protocol/ # 如现有结构没有适合的协议层
-  plugin-api/
-  composition/
-  keynav/
-  completion/
-  intake/
-  reorder/
-  snapshot/
-
-archive/
-  ts/
-  rust/
-
-docs/
-  architecture/
-    composer-asset-inventory.md
-    composer-bridge.md
-    wasm-compatibility.md
-    host-adapters.md
-  testing/
-    composer-baseline.md
-    bridge-conformance.md
-    browser-ime.md
-    desktop-webview.md
+Rust Core Tests
+     |
+Bridge Conformance Tests
+     |
+Lexical Vanilla Tests
+     |
+Dioxus UI Integration Tests
+     |
+Browser E2E
+     |
+Desktop E2E
 ```
 
-不要为了符合这个目录树而移动已有代码。
+## 14.2 跨 Host 对拍
 
-优先采用最小增量结构。
+相同测试序列分别运行：
+
+- Native Core。
+- WASM Core。
+- Dioxus Web。
+- Dioxus Desktop。
+- React 参考实现（迁移完成前）。
+
+对比：
+
+- 事件处理结果。
+- Snapshot。
+- revision。
+- Outbox。
+- Effect 状态。
+- 错误结果。
+- 持久化结果。
+
+不能要求所有平台的环境 ID、时间戳和随机标识完全相同。
+
+只比较应该一致的业务语义。
+
+## 14.3 性能基线
+
+以已经恢复的 React + Lexical 版本作为对照。
+
+记录：
+
+| 指标          | 目标                            |
+| ----------- | ----------------------------- |
+| 输入响应        | 不低于现有基线                       |
+| 中文 IME      | 不低于现有基线                       |
+| Submit      | 不出现明显回归                       |
+| Snapshot 更新 | 版本顺序正确                        |
+| 长文档         | 不出现明显输入卡顿                     |
+| 附件混排        | 不出现明显布局和选择问题                  |
+| 内存          | 记录 Dioxus / Lexical / Core 占用 |
+| 初始化         | 不重复建立 Editor                  |
+| Dispose     | 不泄漏订阅与任务                      |
+
+先记录数据，再制定具体阈值。
+
+不得无数据地宣称 Dioxus 比 React 更快，或 Rust UI 一定占用更少资源。
 
 ---
 
-# 十三、明确的非目标
+# 十五、非目标与禁止事项
 
-本轮禁止把以下事情混入主线：
+本计划执行期间禁止：
 
 1. 重写 composer-core。
 2. 重写 composer-runtime。
-3. 重写 Cordis 式 plugin-api。
-4. 重写 Profile / Bundle / Patch。
-5. 把所有 UI 组件改写为 Rust。
-6. 使用 Dioxus 替代 React 产品线。
-7. 使用 Blitz 替代 Lexical。
-8. 开发 Gecko Desktop Embedder。
-9. 引入 Electron。
-10. 重新设计整套 Harness。
-11. 将 Core 复制为 TypeScript 实现。
-12. 为统一接口而让 Desktop 强制运行 WASM。
-13. 在没有实测依据的情况下引入复杂的 Worker、Actor 或额外服务。
-
-Gecko、Blitz 和 Dioxus 可以继续作为独立技术实验，但不进入本次产品线交付依赖。
+3. 重写 plugin-api。
+4. 重写 composition。
+5. 改变 BM05 已冻结的协议形状。
+6. 改变 BM07 CAS 语义。
+7. 新建第二套 TypeScript Core。
+8. 将 React 作为最终产品 UI。
+9. 继续扩大 `@lexical/react` 依赖。
+10. 为迁移而升级 Lexical 版本。
+11. 用 Dioxus Signals 重新实现 Lexical Selection。
+12. 在每次 Snapshot 更新时重建 Editor。
+13. 用 JSON Base64 传输所有附件二进制。
+14. 使用 Tauri 2 再包一层 Dioxus Desktop。
+15. 在当前交付路径中引入 Gecko Desktop Embedder。
+16. 在没有实测依据时替换 Lexical。
+17. 在核心迁移中顺手重构插件架构。
+18. 删除原有 React 参考资产。
+19. 把未经测试的 IDB 代码视作已完成。
+20. 为追求 100% Rust 而牺牲已经验证的编辑器行为。
 
 ---
 
-# 十四、Agent 工作规则
+# 十六、Agent 执行规则
 
-## 14.1 开始修改之前
+## 16.1 每次开始任务
 
-必须先完成 Phase 0。
+检查：
 
-如果发现本文假设与实际仓库不符：
+```
+git status --short --branch
+git log --oneline -20
+```
 
-- 不要直接按文档猜测实现。
-- 先查看现有类型和调用关系。
-- 优先复用现有 API。
-- 在架构记录中说明调整原因。
-- 选择对核心改动最小的方案。
+检查当前阶段的依赖和历史测试。
 
-## 14.2 开发过程中
+不要按照计划文本猜测仓库实现。
 
-- 每个阶段独立提交或形成可审查的变更集。
-- 不修改 archive 中的原始证据，除非明确需要更新并记录原因。
-- 不删除失败测试。
-- 不增加重复业务逻辑。
-- 不引入无必要的依赖。
-- 不把 Mock 测试结果当作真实 Host 验收。
-- 不为了让编译通过而弱化类型约束。
-- 不在 React 组件中直接调用 Host API。
-- 不在 Core 中引入 DOM、浏览器或 Tauri 依赖。
+以实际代码为准，报告不一致之处。
 
-## 14.3 每个阶段结束时必须报告
+## 16.2 开发顺序
+
+优先顺序：
+
+1. Phase 0。
+2. Phase 1 Vanilla Lexical PoC。
+3. Phase 1 测试和 Go / No-Go。
+4. Phase 2 Dioxus UI。
+5. Phase 3 集成。
+6. Phase 4 Core 接入。
+7. Phase 5 持久化。
+8. Phase 6 Desktop。
+9. Phase 7 回归。
+
+不得同时大规模修改编辑器、Core、Bridge 和持久化。
+
+## 16.3 阶段提交
+
+每个阶段形成独立提交或可审查的变更集。
+
+建议提交顺序：
+
+```
+docs: record plan A+ migration baseline
+feat: extract vanilla lexical controller
+test: restore lexical browser regression suite
+feat: integrate lexical island with dioxus
+feat: connect dioxus composer to rust runtime
+feat: complete indexeddb persistence adapter
+feat: add dioxus desktop host
+test: add cross-host conformance coverage
+```
+
+提交信息按照现有仓库规范调整。
+
+没有通过测试的实现不得标记为完成。
+
+没有用户要求时，不自动推送远端。
+
+## 16.4 每个阶段报告
+
+必须使用以下模板：
 
 ```
 阶段：
+当前 Git HEAD：
+工作树状态：
 修改文件：
 新增文件：
+删除文件：
 复用资产：
 新增依赖：
-核心 API 变化：
+React 运行时依赖变化：
+Lexical 版本变化：
+Bridge 变化：
+Core API 变化：
 测试命令：
 测试结果：
+与基线差异：
 未完成事项：
 已知风险：
+Go / No-Go：
 下一阶段前置条件：
 ```
 
-## 14.4 最终交付
+## 16.5 遇到问题
 
-最终至少提供：
+如果某个阶段不能完成：
 
-1. React + Lexical 产品线。
-2. 统一 Composer Bridge。
-3. WASM Web Host。
-4. Native Tauri Host。
-5. 同一协议下的跨 Host 对拍测试。
-6. B20–B34 恢复情况。
-7. 中文 IME 验收结果。
-8. 桌面 WebView 测试结果。
-9. 架构说明和使用文档。
-10. 明确列出的未完成事项。
+- 不要隐瞒失败。
+- 不要删除测试规避问题。
+- 不要静默降级编辑器行为。
+- 不要擅自修改 Core 语义。
+- 提供最小复现。
+- 提交问题归因。
+- 优先尝试最小适配方案。
+
+遇到明确的架构 Go / No-Go 门失败时，停在该门，交付失败原因和候选方案。
 
 ---
 
-# 十五、最终 Definition of Done
+# 十七、Definition of Done
 
-只有同时满足以下条件，才算完成本次工程任务：
+## 产品 UI
 
-- Rust Core 没有被复制成 TypeScript 业务实现。
-- composer-core / composer-runtime 原有测试全部通过。
-- Plugin System 与 Composition 没有发生非必要语义变化。
-- React + Lexical 正常工作。
-- B20–B34 历史测试已逐项复核。
-- 中文 IME、DOM Selection、撤销、剪贴板通过验收。
-- Composer Bridge 具有明确版本和错误语义。
-- Snapshot 订阅不存在初始化竞态。
-- Dispatch 顺序确定。
-- Effect 回执具备幂等性。
-- Web Host 使用真实 Rust WASM Core。
-- Desktop Host 直接调用 Native Rust Core。
-- Web 与 Desktop 使用同一套协议语义。
-- 同一事件序列的 Native / WASM 对拍通过。
-- Tauri 平台差异有实际测试记录。
-- Dioxus `app-web` 仍然可以独立构建。
-- 没有未经批准的核心重构、编辑器替换或渲染引擎替换。
+- Dioxus 成为产品主 UI。
+- `app-web` 已升级为正式产品前端。
+- 主应用布局由 Rust/Dioxus 实现。
+- Composer 外围 UI 由 Rust/Dioxus 实现。
+- React 不进入最终产品运行时。
+- React 参考实现仍可用于必要的对照测试。
 
-**最终架构结论：一个 Rust Core、一个 Composer Protocol、一个 React + Lexical 产品 UI、两个 Host。Dioxus 保留实验线。**
+## Editor Island
 
-本次任务的首要交付不是完整桌面应用，而是可靠地打通：
+- Lexical Vanilla Controller 已独立。
+- 不依赖 `@lexical/react`。
+- DOM 所有权明确。
+- Editor 初始化和销毁可靠。
+- B 系列测试逐项恢复。
+- 中文 IME 通过。
+- Selection 通过。
+- Undo / Redo 通过。
+- Clipboard 通过。
+- 附件混排通过。
 
-**Lexical 输入 → React Provider → Composer Bridge → Rust Runtime → Submit → Outbox Snapshot → UI 更新。**
+## Rust Core
 
-这条链路必须先在 Web WASM 上真实跑通，再接入 Desktop Native。后续所有功能都建立在这条经过测试的链路之上。
+- Core 未被重复实现。
+- Runtime 原有测试通过。
+- Plugin System 语义不变。
+- BM05 协议形状不变。
+- BM07 CAS 语义不变。
+- Snapshot 一致性通过。
+- Effect 生命周期正确。
+- Submit → Outbox Accepted → 轮次激活通过。
 
-## 我额外强调的三个技术决策
+## Web
 
-1\. WASM 兼容性必须成为早期 Go/No-Go 门。 不能把旧 `archive/rust` 的 WASM 成功经验当成新 `composer-runtime` 已经通过验证。尤其要审查 Fiber、异步任务和平台副作用的依赖边界。
+- 使用真实 Rust WASM Core。
+- 无本地 HTTP 回环作为最终 Core 调用路径。
+- Lexical 与 Dioxus 稳定交互。
+- IndexedDB 真持久化。
+- 刷新和重新打开可以恢复状态。
 
-2\. 不要把 Lexical 变成受控的普通文本框。 它的 DOM 选区、IME composition 和编辑器内部 Selection 有自己的生命周期。Rust 负责业务状态，不代表它应该每次都反向控制编辑器 DOM。
+## Desktop
 
-3\. Bridge 是协议，不是简单的函数包装。 原子订阅、事件排序、revision、Effect 幂等性、dispose 语义都需要测试。否则 Web 和 Desktop 表面上共用接口，实际可能出现不同的业务行为。
+- 使用 Dioxus Desktop。
+- Core 直接执行 Native Rust。
+- 不经 WASM 调用 Native Core。
+- Lexical 在系统 WebView 中正常工作。
+- Windows 中文输入法通过手工验收。
+- 文件和附件功能正常。
+- 资源可以正确释放。
 
-建议先让 Agent 执行 Phase 0，并提交资产清单和 WASM 兼容性报告，再进入 Phase 1。不要让它一次性完成全部阶段后才交付。
+## 架构
 
-后续也可以每周按这份计划复核 Agent 的变更、测试结果和阶段验收。
+- 一个 Rust Core。
+- 一个 Composer Protocol。
+- 一个 Dioxus 产品 UI。
+- 一个独立 Lexical Editor Island。
+- Web WASM / Desktop Native 两种运行路径。
+- Dioxus 不依赖 React。
+- Rust Editor 继续作为可替换的实验方向。
+- 所有历史资产和决策均可追溯。
+
+---
+
+# 十八、首个 Agent 任务
+
+**不要一上来迁移整个应用。**
+
+首先只执行 Phase 0 和 Phase 1。
+
+交付内容：
+
+1. 当前工作树与提交审计。
+2. React / Lexical 依赖清单。
+3. React Plugin → Vanilla API 映射表。
+4. Vanilla Controller 最小实现。
+5. Dioxus 0.7 最小挂载 PoC。
+6. B 系列关键测试迁移结果。
+7. 中文 IME / Selection 测试记录。
+8. Go / No-Go 结论。
+
+最小 PoC 必须完成：
+
+```
+Dioxus 页面启动
+      |
+创建 Lexical Island
+      |
+输入中文
+      |
+选择候选词
+      |
+Ctrl + Shift + 方向键
+      |
+获取 Editor State
+      |
+清空编辑器
+      |
+销毁编辑器
+      |
+重新创建编辑器
+```
+
+同时确认最终页面不依赖 React Runtime。
+
+**Phase 1 通过后，再开始大规模将 `app-web` 发展为产品 UI。**
+
+本项目最终方向是：
+
+**Dioxus 负责产品，Lexical 负责编辑，Rust 负责业务。**
+
+不重写已经可靠的浏览器编辑行为，不丢弃已经完成的 Rust 核心，也不把已经验证过的 React 产品线继续扩大为另一套长期维护的 UI 架构。
+
+## 这份计划与上一版相比，关键改变
+
+我确认过两个关键技术前提：
+
+- Lexical 官方已有 Vanilla JS 使用路线，同一套 Extension 可以脱离 React 使用；各个 `@lexical/*` 包还要求版本一致，且应用应避免加载多份 Lexical Core。
+
+- Dioxus 0.7 支持通过 `document::eval` 运行 JavaScript；Desktop 使用系统 WebView，但 Rust 代码仍在 Native 环境执行。因此 Dioxus 可以直接调用 Native Core，不必再套 Tauri 或 WASM。
+
+我认为最重要的设计调整是：不要把 Lexical Vanilla 化误认为简单删除 React。 原来的 React Plugins 必须逐项迁移到 Vanilla Controller / Extension / Command。Phase 1 就是专门验证这件事的，不能跳过。
+
+另外，这个方案仍有一个明确取舍：它是 Rust-first，而不是 100% Rust。若将来你的 Rust 编辑器通过同一组 IME、Selection、附件混排和撤销测试，可以只替换 Lexical Island，而不用推翻 Dioxus 或 Rust Core。
+
+建议先让 Agent 执行文末的 Phase 0 + Phase 1 PoC，不要立即让它全仓迁移。阶段进展也可以按这份计划定期复核。
