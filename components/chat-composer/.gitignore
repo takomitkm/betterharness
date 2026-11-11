@@ -1,2 +1,7 @@
 .runtime/
 node_modules/
+composer-src.tgz
+demo2-run.sh
+pump-smoke.sh
+fmt-check.sh
+*.tgz
