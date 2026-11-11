@@ -23,6 +23,7 @@ type WasmBridgeModule = {
     dispatch(eventJson: string): string;
     ack(refId: number, outcomeJson: string): string;
     pendingCount(): number;
+    persistRevision(): number;
   };
 };
 
@@ -42,14 +43,18 @@ export class WasmEngine {
   private timeouts = new Map<number, ReturnType<typeof setTimeout>>();
   private options: ComposerOptions;
 
-  constructor(options: ComposerOptions) {
+  private persist: { load(scope: string): Promise<string | null>; cas(scope: string, expected: number, stateJson: string): Promise<boolean> } | null;
+
+  constructor(options: ComposerOptions, persist?: WasmEngine["persist"]) {
     this.options = options;
+    this.persist = persist ?? null;
   }
 
   async initialize(): Promise<void> {
     const module = (await import(/* @vite-ignore */ WASM_BRIDGE_JS)) as unknown as WasmBridgeModule;
     await module.default({ module_or_path: WASM_BINARY });
-    this.bridge = new module.WasmBridge(this.options.scopeId, null);
+    const persisted = (await this.persist?.load(this.options.scopeId)) ?? null;
+    this.bridge = new module.WasmBridge(this.options.scopeId, persisted);
     this.applySnapshot(JSON.parse(this.bridge.snapshot()));
     this.notify();
   }
@@ -125,8 +130,10 @@ export class WasmEngine {
   private async executeEffect(ref: EffectRefDto): Promise<EffectOutcomeDto | null> {
     const effect = ref.effect;
     if (effect.type === "persist") {
-      // v1：内存 CAS 模拟（ok=true）。IndexedDB 接线 = 下一步（CAS 语义不变）。
-      return { outcome: "persisted", ok: true };
+      if (!this.persist) return { outcome: "persisted", ok: true }; // 内存模式（测试/回环演示）。
+      const expected = engine.persistRevision();
+      const ok = await this.persist.cas(this.options.scopeId, expected, JSON.stringify(effect.state));
+      return { outcome: "persisted", ok }; // false → runtime 暂停（FM14），Resume 重试。
     }
     if (effect.type === "deliver") {
       let result: DeliveryResult;
