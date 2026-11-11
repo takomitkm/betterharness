@@ -86,6 +86,7 @@ await page.waitForFunction(() => window.composerTest.engine.getSnapshot().state.
 check('end-turn 后 C 派发并 Accepted（FM12）', (await snapshot()).submissions.find((submission) => submission.text === 'C')?.status === 'accepted');
 
 // 4. 取消全部场景收尾：无页面错误
+// 7. 无未捕获错误
 check('无未捕获页面错误', errors.length === 0, JSON.stringify(errors));
 
 const failed = results.filter((item) => !item.pass);

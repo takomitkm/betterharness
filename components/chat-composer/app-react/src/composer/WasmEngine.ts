@@ -131,7 +131,7 @@ export class WasmEngine {
     const effect = ref.effect;
     if (effect.type === "persist") {
       if (!this.persist) return { outcome: "persisted", ok: true }; // 内存模式（测试/回环演示）。
-      const expected = engine.persistRevision();
+      const expected = this.bridge?.persistRevision() ?? 0;
       const ok = await this.persist.cas(this.options.scopeId, expected, JSON.stringify(effect.state));
       return { outcome: "persisted", ok }; // false → runtime 暂停（FM14），Resume 重试。
     }
@@ -288,8 +288,8 @@ function toDtoResult(result: DeliveryResult, scope: string): DeliveredResultDto 
 }
 
 /** 构造并初始化 WASM 引擎（demo/宿主共用）。 */
-export async function createWasmEngine(options: ComposerOptions): Promise<EngineFace> {
-  const engine = new WasmEngine(options);
+export async function createWasmEngine(options: ComposerOptions, persist?: WasmEngine["persist"]): Promise<EngineFace> {
+  const engine = new WasmEngine(options, persist);
   await engine.initialize();
   return engine;
 }

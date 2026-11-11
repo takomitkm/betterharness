@@ -4,6 +4,7 @@ import { ChatComposer, TextareaEditor, type CompletionProvider, type EditorProps
 import { LexicalEditor } from "./LexicalEditor.tsx";
 import { createComposer, type EngineFace } from "./core.ts";
 import { createWasmEngine } from "./src/composer/WasmEngine.ts";
+import { openIdbStateStore } from "./src/hosts/web/persist.ts";
 import { IndexedDbComposerStore } from "./store.ts";
 import { createHttpTransport } from "./http-transport.ts";
 import { useComposerSubmission } from "./useComposerSubmission.ts";
