@@ -87,6 +87,18 @@ check('end-turn 后 C 派发并 Accepted（FM12）', (await snapshot()).submissi
 
 // 4. 取消全部场景收尾：无页面错误
 // 7. 无未捕获错误
+// IDB 持久化：reload 后 Outbox Accepted 恢复
+await page.reload();
+await page.waitForFunction(() => Boolean(window.composerTest?.engine), { timeout: 15000 });
+await page.waitForFunction(() => window.composerTest.engine.getSnapshot().state.submissions.length > 0, { timeout: 10000 });
+const reloaded = await page.evaluate(() => {
+  const view = window.composerTest.engine.getSnapshot();
+  return { count: view.state.submissions.length, status: view.state.submissions[0]?.status, text: view.state.submissions[0]?.snapshot?.text };
+});
+check('reload 后 Outbox 恢复', reloaded.count > 0 && reloaded.status === 'accepted', JSON.stringify(reloaded));
+check('reload 后文本正确', reloaded.text === '你好 Bridge', reloaded.text);
+
+// 无未捕获错误
 check('无未捕获页面错误', errors.length === 0, JSON.stringify(errors));
 
 const failed = results.filter((item) => !item.pass);

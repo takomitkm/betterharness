@@ -23,7 +23,7 @@ type WasmBridgeModule = {
     dispatch(eventJson: string): string;
     ack(refId: number, outcomeJson: string): string;
     pendingCount(): number;
-    persistRevision(): number;
+    persist_revision(): number;
   };
 };
 
@@ -131,7 +131,7 @@ export class WasmEngine {
     const effect = ref.effect;
     if (effect.type === "persist") {
       if (!this.persist) return { outcome: "persisted", ok: true }; // 内存模式（测试/回环演示）。
-      const expected = this.bridge?.persistRevision() ?? 0;
+      const expected = this.bridge?.persist_revision() ?? 0;
       const ok = await this.persist.cas(this.options.scopeId, expected, JSON.stringify(effect.state));
       return { outcome: "persisted", ok }; // false → runtime 暂停（FM14），Resume 重试。
     }

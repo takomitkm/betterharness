@@ -71,11 +71,14 @@ const instrumented: ComposerStore = {
 };
 // engine=wasm 走真实 Rust Core WASM（PRODUCT-LINE-PLAN Phase 3 首要链路）；
 // 默认 TS 引擎承载 B 系列全量测试（受控 Adapter，见 WasmEngine/README 的范围说明）。
+const wasmPersist = parameters.get("wasm") === "1"
+  ? await openIdbStateStore("composer-bridge-state")
+  : null;
 const engine = parameters.get("wasm") === "1"
   ? await createWasmEngine({
       scopeId, store: instrumented, transport: createHttpTransport(new URL("./", location.href).href, () => scenario),
       sendTimeoutMs: Number(parameters.get("timeout") ?? 1500),
-    })
+    }, wasmPersist)
   : await createComposer({
       scopeId, store: instrumented, transport: createHttpTransport(new URL("./", location.href).href, () => scenario),
       sendTimeoutMs: Number(parameters.get("timeout") ?? 1500),
