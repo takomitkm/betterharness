@@ -1,0 +1,11 @@
+[package]
+name = "composer-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Composer host adapter: typed event/effect dispatch over composer-runtime (A+ Phase 4)"
+
+[dependencies]
+composer-core = { path = "../composer-core" }
+composer-runtime = { path = "../composer-runtime" }

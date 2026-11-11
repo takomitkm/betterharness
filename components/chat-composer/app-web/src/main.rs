@@ -1,22 +1,28 @@
-//! chat-composer 的 Dioxus web 演示面板（计划书 §8）。
+//! chat-composer 的 Dioxus web 演示面板（A+ Phase 4：Rust 直调 Core）。
 //!
-//! 接线的是 composer-core 台账的真实状态：草稿编辑、可靠提交（交接 + 后继空草稿）、
-//! queue/steer 轮次推进（结束本轮后派发下一条）、逐条取回、拒绝重试。Enter/IME 仲裁
-//! 走 composer-keynav 的 decide_enter——组合中的 Enter 交给输入法，绝不误发。
+//! 架构（PRODUCT-LINE-PLAN §7.2）：UI 事件以强类型 [`Event`] 进 ComposerHost
+//! （composer-host crate：Effect 执行 + 结果回灌，排空至不动点）→ composer-runtime
+//! → composer-core。不再有 do_submit 直调 ScopeState 的第二套业务逻辑。
 //!
-//! 演示的传输是**本地回环**：handoff 后立刻 begin_next，主机侧无条件接纳（回执
-//! turn = turn-{消息id}）。真实 HTTP/IndexedDB 适配属于平台适配层，随后接入。
-//! 持久化同样待接：当前状态仅存活于页面内存。
+//! 演示传输 = 回环 EffectExecutor（Deliver 立即接纳，turn-{id} 回执）；persist 为
+//! 内存面（IndexedDB 真持久化在 Phase 5 的 React WASM 线，BM07 CAS 已实证）。
 //!
-//! 构建：`cargo check --target wasm32-unknown-unknown`；运行需要 dx/trunk 打包
-//! （下一步接入 CI）。
+//! Host 住在 use_coroutine 的事件循环里：单消费者天然串行（§7.5 纪律——组件重建
+//! 不会新建业务 Runtime）；UI 只读镜像 signal、发事件。
+//!
+//! Enter/IME 仲裁走 composer-keynav 的 decide_enter——组合中的 Enter 交给输入法。
+//! 构建：`cargo build --target wasm32-unknown-unknown`；运行需要 wasm-bindgen 出包
+//! + vendor 组装（verify/island-e2e.mjs 的 dist 流程）。
 
 use composer_core::ids::{
     AttemptId, Delivery, DeliveryResult, GenerationId, MessageId, Receipt, ScopeId, Status, TurnId,
 };
-use composer_core::state::ScopeState;
+use composer_core::state::{ScopeState, Snapshot};
+use composer_host::{ComposerHost, EffectExecutor};
 use composer_keynav::{decide_enter, EnterDecisionInput};
+use composer_runtime::{Clock, Event, IdGen, RuntimeConfig};
 use dioxus::prelude::*;
+use futures_util::StreamExt;
 use wasm_bindgen::prelude::{wasm_bindgen, Closure};
 use wasm_bindgen::JsCast;
 use Modifiers as KeyModifiers;
@@ -45,7 +51,55 @@ fn main() {
     dioxus::launch(app);
 }
 
-type Engine = Signal<ScopeState>;
+/// 回环执行器：Deliver 立即接纳（回执 scope 必须与配置一致——配错身份时 FM15
+/// 纪律正确兜底转 uncertain，D004 实录）。persist 为内存面：演示台账存活于
+/// 镜像 signal；真持久化见 Phase 5 的 React WASM 线（IDB + BM07 CAS）。
+struct LoopbackExecutor;
+
+impl EffectExecutor for LoopbackExecutor {
+    fn persist(&mut self, _state: &ScopeState) -> bool {
+        true
+    }
+
+    fn deliver(
+        &mut self,
+        id: &MessageId,
+        _attempt: &AttemptId,
+        _delivery: Delivery,
+        _turn: Option<&TurnId>,
+    ) -> DeliveryResult {
+        DeliveryResult::Accepted {
+            receipt: Receipt {
+                id: id.clone(),
+                scope: ScopeId::new("demo/main"),
+                turn: TurnId::new(format!("turn-{id}")),
+            },
+        }
+    }
+
+    fn schedule_timeout(&mut self, _id: &MessageId, _attempt: &AttemptId, _deadline_ms: u64) {}
+
+    fn cancel_timeout(&mut self, _id: &MessageId, _attempt: &AttemptId) {}
+}
+
+/// 时钟：宿主注入（引擎不取系统时间）。
+struct WebClock;
+
+impl Clock for WebClock {
+    fn now_ms(&self) -> u64 {
+        js_sys::Date::now() as u64
+    }
+}
+
+/// 身份生成：时间戳前缀 + 计数器（单页演示不碰撞）。
+struct WebIds(u64);
+
+impl IdGen for WebIds {
+    fn next_id(&mut self) -> String {
+        self.0 += 1;
+        format!("w-{:x}-{}", js_sys::Date::now() as u64, self.0)
+    }
+}
 
 /// 状态标签，对齐 archive/ts ChatComposer 的 statusLabels。
 fn status_label(status: Status) -> &'static str {
@@ -59,87 +113,13 @@ fn status_label(status: Status) -> &'static str {
     }
 }
 
-/// 循环回环主机：立刻接纳并给出轮次回执（真实宿主换成 HTTP 传输）。
-fn admit_locally(state: &mut ScopeState, id: &MessageId, attempt: &AttemptId) {
-    let turn = TurnId::new(format!("turn-{id}"));
-    let _ = state.settle(
-        id,
-        Some(attempt),
-        DeliveryResult::Accepted {
-            receipt: Receipt {
-                id: id.clone(),
-                scope: ScopeId::new("demo/main"),
-                turn,
-            },
-        },
-    );
-}
-
-/// 可靠提交：交接进 outbox → 派发 → 回环接纳。交接与后继空草稿是同一次状态变更
-/// （引擎守卫拒绝空草稿与重复 ID，与 archive/ts 语义一致）。
-/// 返回是否成功交接（失败 = 空草稿/重复 ID，island 文本保持不动）。
-fn do_submit(mut state: Engine, mut counter: Signal<u64>, mut admitting: Signal<bool>) -> bool {
-    if admitting() {
-        return false;
-    }
-    counter.set(counter() + 1);
-    let message = MessageId::new(format!("m{}", counter()));
-    let generation = GenerationId::new(format!("gen-{}", counter()));
-    let mut next = state.read().clone();
-    if next
-        .handoff(message, generation, Delivery::Start, counter())
-        .is_err()
-    {
-        return false;
-    }
-    admitting.set(true);
-    state.set(next);
-    let mut dispatched = state.read().clone();
-    let attempt = AttemptId::new(format!("a{}", counter()));
-    if let Some((id, attempt, _delivery, _turn)) = dispatched.begin_next(attempt) {
-        admit_locally(&mut dispatched, &id, &attempt);
-    }
-    state.set(dispatched);
-    admitting.set(false);
-    true
-}
-
-/// 结束当前轮次：轮次结束后派发下一条排队消息（FIFO，B08 语义）。
-fn do_end_turn(mut state: Engine, mut counter: Signal<u64>) {
-    let mut next = state.read().clone();
-    if let Some(turn) = next.active_turn.clone() {
-        next.end_turn(&turn);
-        counter.set(counter() + 1);
-        let attempt = AttemptId::new(format!("a-end-{}", counter()));
-        if let Some((id, attempt, _delivery, _turn)) = next.begin_next(attempt) {
-            admit_locally(&mut next, &id, &attempt);
-        }
-        state.set(next);
-    }
-}
-
-/// 逐条取回（queued/rejected → 取回编辑）：要求当前草稿为空，引擎守卫保证不覆盖输入。
-fn do_recall(mut state: Engine, counter: Signal<u64>, id: String) {
-    let mut next = state.read().clone();
-    let generation = GenerationId::new(format!("gen-r-{}", counter()));
-    let _ = next.restore(&MessageId::new(&id), generation);
-    state.set(next);
-}
-
-/// 拒绝原样重试（保留原消息身份）。
-fn do_retry(mut state: Engine, id: String) {
-    let mut next = state.read().clone();
-    let _ = next.retry(&MessageId::new(&id));
-    state.set(next);
-}
-
 fn app() -> Element {
-    // 台账是唯一事实：UI 只读状态、发事件。
-    let mut state: Engine =
+    // 台账镜像：协程在每次排空后整本刷新。UI 只读它 + 发事件（§7.5：不在 UI 复制
+    // 一份拥有独立写入权的业务台账）。
+    let mut ledger: Signal<ScopeState> =
         use_signal(|| ScopeState::new(ScopeId::new("demo/main"), GenerationId::new("gen-0")));
-    let counter = use_signal(|| 0u64);
-    // 在途提交窗口：交接到接纳之间输入框只读（admitting 语义）。
-    let admitting = use_signal(|| false);
+    // 在途提交窗口（Runtime 的 admitting 瞬时态镜像）：交接到落盘之间输入框只读。
+    let mut admitting = use_signal(|| false);
     // 编辑器模式：?editor=lexical 走 Lexical Island（A+ Phase 1 挂载 PoC），默认 textarea。
     let editor_mode_lexical = web_sys::window()
         .map(|window| window.location().search().unwrap_or_default().contains("editor=lexical"))
@@ -147,35 +127,47 @@ fn app() -> Element {
 
     // 台账镜像随渲染刷新（composer_view_json 测试钩子的数据面；read 同时订阅渲染）。
     LEDGER_MIRROR.with(|cell| {
-        *cell.borrow_mut() = Some(state.read().clone());
+        *cell.borrow_mut() = Some(ledger.read().clone());
     });
 
-    // island 事件桥：JS Island 发 CustomEvent('bh-island-event')，这里监听并驱动台账。
-    // 闭包 forget 存活整个应用生命周期（PoC 无 close 路径；FM18 语义属 Runtime）。
+    // Composer 宿主事件循环：Host 唯一所有者。事件 → 排空 → 镜像刷新。
+    let events = use_coroutine(move |mut rx: UnboundedReceiver<Event>| async move {
+        let mut host = ComposerHost::new(
+            RuntimeConfig {
+                scope: ScopeId::new("demo/main"),
+                send_timeout_ms: 1500,
+            },
+            ScopeState::new(ScopeId::new("demo/main"), GenerationId::new("gen-0")),
+            LoopbackExecutor,
+            WebClock,
+            WebIds(0),
+        );
+        while let Some(event) = rx.next().await {
+            let was_submit = matches!(event, Event::Submit);
+            host.dispatch(event);
+            ledger.set(host.state().clone());
+            admitting.set(host.is_admitting());
+            if was_submit && host.last_dispatch_handed_off() {
+                // 交接成功 → island 文本随草稿清空（交接与清空是同一次状态变更的 UI 面）。
+                global_eval("window.__islandController && window.__islandController.clear()");
+            }
+        }
+    });
+
+    // island 事件桥：JS Island CustomEvent → 强类型 Event 进协程（Phase 4 直调面）。
+    // JSON 形状沿用 D009：{type: "submit-request"} / {type: "document-changed", text}。
     use_effect(move || {
-        let mut state = state.clone();
-        let counter = counter.clone();
-        let admitting = admitting.clone();
+        let tx = events.clone();
         let closure = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |event: web_sys::CustomEvent| {
             let detail = event.detail().as_string().unwrap_or_default();
-            // island 事件 JSON：{type: "submit-request"} / {type: "document-changed", text}。
             let Ok(payload) = serde_json::from_str::<serde_json::Value>(&detail) else {
                 return;
             };
             match payload.get("type").and_then(|value| value.as_str()) {
-                Some("submit-request") => {
-                    if do_submit(state.clone(), counter.clone(), admitting.clone()) {
-                        // 交接成功 → island 文本随草稿清空（交接与清空是同一次状态变更的 UI 面）。
-                        global_eval("window.__islandController && window.__islandController.clear()");
-                    }
-                }
+                Some("submit-request") => tx.send(Event::Submit),
                 Some("document-changed") => {
-                    // island 文本 → Rust Core 草稿：island 是编辑态唯一事实，document-changed
-                    // 事件不带文本，宿主在事件出口处取 getPlainText 一起传回（Phase 3 集成核心面）。
                     if let Some(text) = payload.get("text").and_then(|value| value.as_str()) {
-                        let mut next = state.read().clone();
-                        next.edit(composer_core::state::Snapshot::text(text));
-                        state.set(next);
+                        tx.send(Event::Edit { snapshot: Snapshot::text(text) });
                     }
                 }
                 _ => {}
@@ -188,11 +180,11 @@ fn app() -> Element {
         closure.forget(); // 应用生命周期存续
     });
 
-    let draft_text = state.read().draft.snapshot.text.clone();
-    let draft_empty = !state.read().draft.snapshot.has_content();
-    let turn_running = state.read().active_turn.is_some();
+    let draft_text = ledger.read().draft.snapshot.text.clone();
+    let draft_empty = !ledger.read().draft.snapshot.has_content();
+    let turn_running = ledger.read().active_turn.is_some();
 
-    let records: Vec<(String, Status, String)> = state
+    let records: Vec<(String, Status, String)> = ledger
         .read()
         .submissions
         .iter()
@@ -229,9 +221,7 @@ fn app() -> Element {
                 value: "{draft_text}",
                 readonly: admitting(),
                 oninput: move |event| {
-                    let mut next = state.read().clone();
-                    next.edit(composer_core::state::Snapshot::text(event.value()));
-                    state.set(next);
+                    events.send(Event::Edit { snapshot: Snapshot::text(event.value()) });
                 },
                 onkeydown: move |event| {
                     let data = event.data();
@@ -245,15 +235,13 @@ fn app() -> Element {
                         ctrl_key: data.modifiers().contains(KeyModifiers::CONTROL),
                         meta_key: data.modifiers().contains(KeyModifiers::META),
                         is_composing: data.is_composing(),
-                        repeat: false, // dioxus 0.7 KeyboardData 未暴露 repeat；连发守卫由 KD06（keynav 原生测试）与引擎守卫兜底
+                        repeat: false, // dioxus 0.7 KeyboardData 未暴露 repeat；连发守卫由 KD06（keynav 原生测试）与 Runtime 的 inflight 兜底
                         // 演示无真实时钟：组合结束的 10ms 宽限窗需要宿主注入 Date.now()，
                         // 随平台适配层接入（KD03 在 keynav crate 已原生测试覆盖）。
                         ..Default::default()
                     });
                     match decision.kind {
-                        composer_keynav::VerdictKind::Submit => {
-                            do_submit(state, counter, admitting);
-                        }
+                        composer_keynav::VerdictKind::Submit => events.send(Event::Submit),
                         composer_keynav::VerdictKind::Newline => {
                             // 换行交给浏览器默认行为：不 preventDefault，textarea 自行插入。
                         }
@@ -263,8 +251,17 @@ fn app() -> Element {
             }
             }
             div { class: "actions",
-                button { class: "primary", onclick: move |_| { do_submit(state, counter, admitting); }, disabled: draft_empty || admitting(), "发送" }
-                button { "data-testid": "end-turn", onclick: move |_| { do_end_turn(state, counter); }, disabled: !turn_running, "结束本轮" }
+                button { class: "primary", onclick: move |_| events.send(Event::Submit), disabled: draft_empty || admitting(), "发送" }
+                button {
+                    "data-testid": "end-turn",
+                    onclick: move |_| {
+                        if let Some(turn) = ledger.read().active_turn.clone() {
+                            events.send(Event::EndTurn(turn));
+                        }
+                    },
+                    disabled: !turn_running,
+                    "结束本轮"
+                }
             }
             p { class: "status",
                 if admitting() {
@@ -277,34 +274,27 @@ fn app() -> Element {
             }
             ol { class: "outbox",
                 for (id, status, text) in records {
-                    RecordRow { key: "{id}", state, counter, id, status, text }
+                    RecordRow { key: "{id}", events: events.clone(), id, status, text }
                 }
             }
         }
     }
 }
 
-/// 单条提交记录行：id 作为 prop 进入组件，各按钮闭包各自克隆，互不争用。
+/// 单条提交记录行：id 作为 prop 进入组件，事件走协程（Phase 4：UI 不碰台账写面）。
 #[component]
-fn RecordRow(
-    mut state: Engine,
-    counter: Signal<u64>,
-    id: String,
-    status: Status,
-    text: String,
-) -> Element {
-    // 每个按钮闭包各自持有一份 id 克隆（move 闭包不能共享同一绑定）。
+fn RecordRow(events: Coroutine<Event>, id: String, status: Status, text: String) -> Element {
     let recall_id = id.clone();
     let retry_id = id.clone();
     rsx! {
         li { class: "record",
             strong { {status_label(status)} }
             span { class: "text", "{text}" }
-            if matches!(status, Status::Queued | Status::Rejected) {
-                button { onclick: move |_| do_recall(state, counter, recall_id.clone()), "取回编辑" }
+            if matches!(status, Status::Queued | Status::Rejected | Status::Cancelled) {
+                button { onclick: move |_| events.send(Event::Restore { id: MessageId::new(&recall_id) }), "取回编辑" }
             }
             if matches!(status, Status::Rejected) {
-                button { onclick: move |_| do_retry(state, retry_id.clone()), "原样重试" }
+                button { onclick: move |_| events.send(Event::Retry { id: MessageId::new(&retry_id) }), "原样重试" }
             }
         }
     }
