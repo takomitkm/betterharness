@@ -60,6 +60,10 @@ await page.waitForFunction(() => window.__islandController?.getPlainText()?.incl
 check("2a 中文合成输入可见", true);
 
 // ═══ 3. IME 组合中 Enter 不提交（失效模式 4） ═══
+// 注：Lexical 在组合期间不派发 KEY_ENTER_COMMAND（探针 __enterTrace 实证），真实输入法
+// 会抑制 Enter 默认键；合成事件流没有输入法，浏览器默认键会插 <br>——组合循环后用
+// setDocument 恢复快照，模拟真实 IME 收尾后的编辑器状态（文本完整、光标折叠）。
+const savedDoc = await page.evaluate(() => window.__islandController.getDocument());
 await page.evaluate(() => {
   const root = document.querySelector("[data-lexical-root]");
   root.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true, data: "测" }));
@@ -71,11 +75,32 @@ await page.evaluate(() => {
   const root = document.querySelector("[data-lexical-root]");
   root.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "测" }));
 });
+await page.evaluate((doc) => { window.__islandController.setDocument(doc); }, savedDoc);
+await page.evaluate(() => {
+  const sel = document.getSelection();
+  if (sel && sel.rangeCount) { sel.collapseToEnd(); }
+});
+await page.waitForFunction(() => window.__islandController.getPlainText() === "你好 Bridge", { timeout: 5000 });
+check("3b 组合循环后文本完整（setDocument 恢复 + 光标折叠）", true);
 
 // ═══ 4. Enter 提交 → Outbox Accepted + FM01 ═══
+// 3a 的 compositionend 开了 10ms 宽限窗（KD03）：窗内 Enter 归 IME。等窗外再按。
+await page.waitForTimeout(60);
 await page.evaluate(() => { window.__islandEvents = []; });
+await page.evaluate(() => document.querySelector("[data-lexical-root]").focus());
 await page.keyboard.press("Enter");
-await page.waitForFunction(() => (window.__islandEvents ?? []).some((event) => event.type === "submit-request"), { timeout: 10000 });
+let enterDiag = null;
+try {
+  await page.waitForFunction(() => (window.__islandEvents ?? []).some((event) => event.type === "submit-request"), { timeout: 10000 });
+} catch {
+  enterDiag = await page.evaluate(() => ({
+    events: window.__islandEvents ?? [],
+    ime: window.__islandController?.imeState?.() ?? null,
+    islandText: window.__islandController?.getPlainText() ?? null,
+    focused: document.activeElement?.getAttribute?.("data-lexical-root") ?? (document.activeElement?.tagName ?? null),
+  }));
+}
+check("4-pre Enter → submit-request", enterDiag === null, JSON.stringify(enterDiag));
 await waitForOutbox(0, "accepted");
 let view = await composerView();
 check("4a Outbox Accepted", view.state.submissions[0]?.status === "accepted");
@@ -92,20 +117,25 @@ await typeInIsland("hello world");
 await page.waitForFunction(() => window.__islandController?.getPlainText() === "hello world", { timeout: 5000 });
 check("5b 重新输入正常", true);
 
-// ═══ 6. 多段提交：turn 闸门 + 排队 + end-turn 派发 ═══
-await page.evaluate(() => { window.__islandEvents = []; });
+// ═══ 6. 多段提交：turn 闸门 + 排队 + end-turn FIFO 派发 ═══
+// 5b 的 "hello world" 还在 island 里：turn 活跃期间 Enter → 入队（B08）。
 await page.keyboard.press("Enter");
-await waitForOutbox(0, "accepted");
-await page.evaluate(() => { window.__islandEvents = []; });
-await typeInIsland("第二条");
-await page.keyboard.press("Enter");
-await page.waitForFunction(() => window.__composerView()?.state?.submissions?.length === 2, { timeout: 10000 });
+await page.waitForFunction(() => window.__composerView()?.state?.submissions?.length === 2, undefined, { timeout: 10000 });
 view = await composerView();
-check("6a 第二条排队（turn 活跃）", view.state.submissions[1]?.status === "queued", view.state.submissions[1]?.status);
+check("6a turn 活跃期间第二条入队", view.state.submissions[1]?.status === "queued", view.state.submissions[1]?.status);
 check("6b turn 激活", view.state.active_turn !== null, view.state.active_turn);
+await page.evaluate(() => { window.__islandEvents = []; });
+await typeInIsland("第三条");
+await page.keyboard.press("Enter");
+await page.waitForFunction(() => window.__composerView()?.state?.submissions?.length === 3, undefined, { timeout: 10000 });
+view = await composerView();
+check("6c 第三条继续排队（FIFO 尾部）", view.state.submissions[2]?.status === "queued", view.state.submissions[2]?.status);
 await page.getByTestId("end-turn").click();
-await page.waitForFunction(() => window.__composerView()?.state?.submissions?.[1]?.status === "accepted", { timeout: 10000 });
-check("6c end-turn 后第二条 Accepted（FM12）", (await composerView()).state.submissions[1]?.status === "accepted");
+await page.waitForFunction(() => window.__composerView()?.state?.submissions?.[1]?.status === "accepted", undefined, { timeout: 10000 });
+check("6d end-turn 派发队首（FM12 FIFO）", (await composerView()).state.submissions[1]?.status === "accepted");
+await page.getByTestId("end-turn").click();
+await page.waitForFunction(() => window.__composerView()?.state?.submissions?.[2]?.status === "accepted", undefined, { timeout: 10000 });
+check("6e 第二次 end-turn 派发队尾", (await composerView()).state.submissions[2]?.status === "accepted");
 
 // ═══ 7. 选区保持（outbox 更新触发 re-render 后光标不跳） ═══
 await typeInIsland("selection test");
@@ -143,7 +173,7 @@ const dualCount = await page.evaluate(() => {
   });
   return document.querySelectorAll("[data-lexical-root]").length;
 });
-check("8a 双 Island 并行", dualCount === 3, dualCount);
+check("8a 双 Island 并行（island1 + island2 两个 root）", dualCount === 2, dualCount);
 await page.evaluate(() => window.__controller2.focus());
 await page.keyboard.type("editor2");
 const text2 = await page.evaluate(() => window.__controller2?.getPlainText?.() ?? "");

@@ -21,7 +21,7 @@ use wasm_bindgen::prelude::{wasm_bindgen, Closure};
 use wasm_bindgen::JsCast;
 use Modifiers as KeyModifiers;
 
-/// 台账镜像（PoC 测试钩子 __composerView 的数据源）：每次渲染随 signal 刷新。
+// 台账镜像（PoC 测试钩子 __composerView 的数据源）：每次渲染随 signal 刷新。
 thread_local! {
     static LEDGER_MIRROR: std::cell::RefCell<Option<ScopeState>> = const { std::cell::RefCell::new(None) };
 }
@@ -32,6 +32,13 @@ pub fn composer_view_json() -> String {
     LEDGER_MIRROR.with(|cell| {
         cell.borrow().as_ref().map(|state| serde_json::to_string(state).expect("ledger serializes")).unwrap_or_else(|| "{}".into())
     })
+}
+
+/// 全局 eval：island 清空等 JS 侧动作（web-sys 的 Window::eval 需额外 feature，直接绑全局函数最省）。
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_name = eval)]
+    fn global_eval(code: &str);
 }
 
 fn main() {
@@ -70,9 +77,10 @@ fn admit_locally(state: &mut ScopeState, id: &MessageId, attempt: &AttemptId) {
 
 /// 可靠提交：交接进 outbox → 派发 → 回环接纳。交接与后继空草稿是同一次状态变更
 /// （引擎守卫拒绝空草稿与重复 ID，与 archive/ts 语义一致）。
-fn do_submit(mut state: Engine, mut counter: Signal<u64>, mut admitting: Signal<bool>) {
+/// 返回是否成功交接（失败 = 空草稿/重复 ID，island 文本保持不动）。
+fn do_submit(mut state: Engine, mut counter: Signal<u64>, mut admitting: Signal<bool>) -> bool {
     if admitting() {
-        return;
+        return false;
     }
     counter.set(counter() + 1);
     let message = MessageId::new(format!("m{}", counter()));
@@ -82,7 +90,7 @@ fn do_submit(mut state: Engine, mut counter: Signal<u64>, mut admitting: Signal<
         .handoff(message, generation, Delivery::Start, counter())
         .is_err()
     {
-        return;
+        return false;
     }
     admitting.set(true);
     state.set(next);
@@ -93,6 +101,7 @@ fn do_submit(mut state: Engine, mut counter: Signal<u64>, mut admitting: Signal<
     }
     state.set(dispatched);
     admitting.set(false);
+    true
 }
 
 /// 结束当前轮次：轮次结束后派发下一条排队消息（FIFO，B08 语义）。
@@ -130,22 +139,46 @@ fn app() -> Element {
         use_signal(|| ScopeState::new(ScopeId::new("demo/main"), GenerationId::new("gen-0")));
     let counter = use_signal(|| 0u64);
     // 在途提交窗口：交接到接纳之间输入框只读（admitting 语义）。
-    let mut admitting = use_signal(|| false);
+    let admitting = use_signal(|| false);
     // 编辑器模式：?editor=lexical 走 Lexical Island（A+ Phase 1 挂载 PoC），默认 textarea。
     let editor_mode_lexical = web_sys::window()
         .map(|window| window.location().search().unwrap_or_default().contains("editor=lexical"))
         .unwrap_or(false);
 
+    // 台账镜像随渲染刷新（composer_view_json 测试钩子的数据面；read 同时订阅渲染）。
+    LEDGER_MIRROR.with(|cell| {
+        *cell.borrow_mut() = Some(state.read().clone());
+    });
+
     // island 事件桥：JS Island 发 CustomEvent('bh-island-event')，这里监听并驱动台账。
     // 闭包 forget 存活整个应用生命周期（PoC 无 close 路径；FM18 语义属 Runtime）。
     use_effect(move || {
-        let state = state.clone();
+        let mut state = state.clone();
         let counter = counter.clone();
         let admitting = admitting.clone();
         let closure = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |event: web_sys::CustomEvent| {
             let detail = event.detail().as_string().unwrap_or_default();
-            if detail.contains("submit-request") {
-                do_submit(state.clone(), counter.clone(), admitting.clone());
+            // island 事件 JSON：{type: "submit-request"} / {type: "document-changed", text}。
+            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&detail) else {
+                return;
+            };
+            match payload.get("type").and_then(|value| value.as_str()) {
+                Some("submit-request") => {
+                    if do_submit(state.clone(), counter.clone(), admitting.clone()) {
+                        // 交接成功 → island 文本随草稿清空（交接与清空是同一次状态变更的 UI 面）。
+                        global_eval("window.__islandController && window.__islandController.clear()");
+                    }
+                }
+                Some("document-changed") => {
+                    // island 文本 → Rust Core 草稿：island 是编辑态唯一事实，document-changed
+                    // 事件不带文本，宿主在事件出口处取 getPlainText 一起传回（Phase 3 集成核心面）。
+                    if let Some(text) = payload.get("text").and_then(|value| value.as_str()) {
+                        let mut next = state.read().clone();
+                        next.edit(composer_core::state::Snapshot::text(text));
+                        state.set(next);
+                    }
+                }
+                _ => {}
             }
         });
         let window = web_sys::window().expect("no window");
@@ -184,7 +217,7 @@ fn app() -> Element {
                         // island.js（vanilla bundle）已先行加载：window.createController 存在。
                         spawn(async move {
                             let _ = document::eval(
-                                "window.__islandMount = () => { window.__islandController = window.createController({ container: document.getElementById('lexical-island-container'), placeholder: '写下一条消息…（Enter 发送）', canSubmit: () => true, onEvent: (event) => window.dispatchEvent(new CustomEvent('bh-island-event', { detail: JSON.stringify(event) })) }); }; window.__islandRemount = () => { if (window.__islandController) window.__islandController.destroy(); window.__islandMount(); }; window.__islandMount();",
+                                "window.__islandMount = () => { window.__islandController = window.createController({ container: document.getElementById('lexical-island-container'), placeholder: '写下一条消息…（Enter 发送）', canSubmit: () => true, onEvent: (event) => { const enriched = event.type === 'document-changed' ? Object.assign({}, event, { text: window.__islandController.getPlainText() }) : event; (window.__islandEvents ??= []).push(enriched); window.dispatchEvent(new CustomEvent('bh-island-event', { detail: JSON.stringify(enriched) })); } }); }; window.__islandRemount = () => { if (window.__islandController) window.__islandController.destroy(); window.__islandMount(); }; window.__islandMount();",
                             ).await;
                         });
                     },
@@ -218,7 +251,9 @@ fn app() -> Element {
                         ..Default::default()
                     });
                     match decision.kind {
-                        composer_keynav::VerdictKind::Submit => do_submit(state, counter, admitting),
+                        composer_keynav::VerdictKind::Submit => {
+                            do_submit(state, counter, admitting);
+                        }
                         composer_keynav::VerdictKind::Newline => {
                             // 换行交给浏览器默认行为：不 preventDefault，textarea 自行插入。
                         }
@@ -228,8 +263,8 @@ fn app() -> Element {
             }
             }
             div { class: "actions",
-                button { class: "primary", onclick: move |_| do_submit(state, counter, admitting), disabled: draft_empty || admitting(), "发送" }
-                button { onclick: move |_| do_end_turn(state, counter), disabled: !turn_running, "结束本轮" }
+                button { class: "primary", onclick: move |_| { do_submit(state, counter, admitting); }, disabled: draft_empty || admitting(), "发送" }
+                button { "data-testid": "end-turn", onclick: move |_| { do_end_turn(state, counter); }, disabled: !turn_running, "结束本轮" }
             }
             p { class: "status",
                 if admitting() {

@@ -55,8 +55,11 @@ export const INDEX_HTML = String.raw`<!DOCTYPE html>
   <div id="main"></div>
   <script src="island.js"></script>
   <script type="module">
-    import init from './app_web.js';
-    init().catch((error) => { document.body.prepend('WASM init failed: ' + error); });
+    import init, { composer_view_json } from './app_web.js';
+    init().then(() => {
+      // PoC 测试钩子：E2E 断言走 __composerView().state.<台账字段>。
+      window.__composerView = () => ({ state: JSON.parse(composer_view_json()) });
+    }).catch((error) => { document.body.prepend('WASM init failed: ' + error); });
   </script>
 </body>
 </html>

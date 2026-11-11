@@ -145,7 +145,21 @@ export function createController(options: CreateControllerOptions): LexicalContr
           hasMenu: hasMenu(),
           canSubmit: canSubmit(),
         });
+        // 探针追踪（E2E 诊断用；运行时开销可忽略）。
+        (window as unknown as { __enterTrace?: unknown[] }).__enterTrace ??= [];
+        (window as unknown as { __enterTrace: unknown[] }).__enterTrace.push({
+          kind: verdict.kind,
+          trackerComposing: imeSnapshot.composing,
+          eventIsComposing: event.isComposing,
+        });
         if (verdict.preventDefault) event.preventDefault();
+        if (verdict.kind === "hand-to-ime") {
+          // DOM 护栏：真实 IME 下浏览器默认动作本被输入法抑制，preventDefault 是无害冗余；
+          // 合成/降级环境下（无真实 IME），默认 Enter 会直接改写 contenteditable 并在
+          // composition 收尾时炸掉编辑器状态——必须拦下。textarea 路径的 catch-all
+          // prevent_default 语义与此对齐。
+          event.preventDefault();
+        }
         if (verdict.kind === "submit") onEvent({ type: "submit-request" });
         return verdict.kind !== "newline" && verdict.kind !== "hand-to-ime";
       },
