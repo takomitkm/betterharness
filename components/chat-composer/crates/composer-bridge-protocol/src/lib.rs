@@ -184,6 +184,8 @@ pub struct BridgeCore {
     ids: Arc<Mutex<FnIds>>,
     revision: u64,
     next_ref: u64,
+    /// 已成功落盘的持久化次数（Persist Effect 的 CAS expected 依据，D005）。
+    persist_revision: u64,
     /// ref_id → 原始内部 Effect（ack 时提取 id/attempt 并回填 runtime 事件）。
     pending: BTreeMap<u64, PendingEffect>,
 }
@@ -203,8 +205,14 @@ impl BridgeCore {
             ids: Arc::new(Mutex::new(FnIds(Mutex::new(ids)))),
             revision: 0,
             next_ref: 0,
+            persist_revision: 0,
             pending: BTreeMap::new(),
         }
+    }
+
+    /// 下一次 Persist 的 CAS expected 修订（= 已成功落盘次数）。宿主在 ack 前调用。
+    pub fn persist_revision(&self) -> u64 {
+        self.persist_revision
     }
 
     /// 当前快照（不推进状态）。
@@ -225,6 +233,10 @@ impl BridgeCore {
         outcome: EffectOutcomeDto,
     ) -> Result<DispatchResultDto, AckError> {
         let effect = self.pending.remove(&ref_id).ok_or(AckError::UnknownRef)?;
+        if matches!((&effect, &outcome), (Effect::Persist(_), EffectOutcomeDto::Persisted { ok: true })) {
+            // 落盘成功：CAS 修订前移。ok=false（冲突/失败）不递增——宿主用同一 expected 重试（FM23）。
+            self.persist_revision += 1;
+        }
         let internal = map_outcome(&effect, outcome).ok_or(AckError::OutcomeMismatch)?;
         Ok(self.run(internal))
     }
@@ -665,5 +677,23 @@ mod tests {
         let after = bridge.dispatch(ComposerEventDto::Edit { text: "X".into() });
         assert!(after.effects.is_empty(), "关闭后一切被拒");
         assert_eq!(after.snapshot.state.draft.snapshot.text, "");
+    }
+    /// BM07：persist_revision 序列——每次落盘 ok 递增，失败/冲突保持（CAS expected 依据）。
+    #[test]
+    fn bm07_persist_revision_tracks_successful_persists() {
+        let mut bridge = bridge();
+        assert_eq!(bridge.persist_revision(), 0);
+        bridge.dispatch(ComposerEventDto::Edit { text: "A".into() });
+        let _ = bridge.ack(1, EffectOutcomeDto::Persisted { ok: true });
+        assert_eq!(bridge.persist_revision(), 1);
+        // 冲突：ok=false 不递增（宿主重试用同一 expected）；引用已消费。
+        bridge.dispatch(ComposerEventDto::Edit { text: "B".into() });
+        let conflict = bridge.ack(2, EffectOutcomeDto::Persisted { ok: false }).unwrap();
+        assert_eq!(conflict.snapshot.revision, 4, "冲突确认也发射快照（revision 每发必增，D002）");
+        assert_eq!(bridge.persist_revision(), 1, "失败不前移");
+        // 恢复：ok=true 递增。
+        bridge.dispatch(ComposerEventDto::Edit { text: "C".into() });
+        let _ = bridge.ack(3, EffectOutcomeDto::Persisted { ok: true });
+        assert_eq!(bridge.persist_revision(), 2);
     }
 }
