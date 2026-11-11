@@ -60,7 +60,7 @@ await page.waitForFunction(() => window.__islandController?.getPlainText()?.incl
 check("2a 中文合成输入可见", true);
 
 // ═══ 3. IME 组合中 Enter 不提交（失效模式 4） ═══
-// 注：Lexical 在组合期间不派发 KEY_ENTER_COMMAND（探针 __enterTrace 实证），真实输入法
+// 注：Lexical 在组合期间不派发 KEY_ENTER_COMMAND（D009 探针实录），真实输入法
 // 会抑制 Enter 默认键；合成事件流没有输入法，浏览器默认键会插 <br>——组合循环后用
 // setDocument 恢复快照，模拟真实 IME 收尾后的编辑器状态（文本完整、光标折叠）。
 const savedDoc = await page.evaluate(() => window.__islandController.getDocument());

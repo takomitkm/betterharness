@@ -34,7 +34,8 @@ await page.evaluate(() => {
 });
 await collapse();
 
-await page.evaluate(() => { window.__enterTrace = []; });
+// __enterTrace 探针已随 Phase 7 清理移除（D009 实录：组合中 Lexical 不派发
+// KEY_ENTER_COMMAND）；本探针保留合成组合 DOM 状态 dump 用途。
 await page.evaluate(() => {
   const root = document.querySelector("[data-lexical-root]");
   root.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true, data: "测" }));
@@ -47,11 +48,10 @@ await page.evaluate(() => {
 await page.waitForTimeout(100);
 
 const result = await page.evaluate(() => ({
-  trace: window.__enterTrace ?? "NO TRACE (handler never ran)",
   text: window.__islandController.getPlainText(),
   events: (window.__islandEvents ?? []).map((event) => event.type),
 }));
-console.log("V1 trace:", JSON.stringify(result).slice(0, 600));
+console.log("V1 result:", JSON.stringify(result).slice(0, 600));
 console.log("errors:", JSON.stringify(errors));
 await browser.close();
 server.close();
