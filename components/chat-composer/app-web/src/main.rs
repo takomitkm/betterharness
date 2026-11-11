@@ -17,7 +17,22 @@ use composer_core::ids::{
 use composer_core::state::ScopeState;
 use composer_keynav::{decide_enter, EnterDecisionInput};
 use dioxus::prelude::*;
+use wasm_bindgen::prelude::{wasm_bindgen, Closure};
+use wasm_bindgen::JsCast;
 use Modifiers as KeyModifiers;
+
+/// 台账镜像（PoC 测试钩子 __composerView 的数据源）：每次渲染随 signal 刷新。
+thread_local! {
+    static LEDGER_MIRROR: std::cell::RefCell<Option<ScopeState>> = const { std::cell::RefCell::new(None) };
+}
+
+/// PoC 测试钩子：当前台账 JSON（A+ 计划 §十八「获取 Editor State」之外的台账面）。
+#[wasm_bindgen]
+pub fn composer_view_json() -> String {
+    LEDGER_MIRROR.with(|cell| {
+        cell.borrow().as_ref().map(|state| serde_json::to_string(state).expect("ledger serializes")).unwrap_or_else(|| "{}".into())
+    })
+}
 
 fn main() {
     dioxus::launch(app);
@@ -115,7 +130,30 @@ fn app() -> Element {
         use_signal(|| ScopeState::new(ScopeId::new("demo/main"), GenerationId::new("gen-0")));
     let counter = use_signal(|| 0u64);
     // 在途提交窗口：交接到接纳之间输入框只读（admitting 语义）。
-    let admitting = use_signal(|| false);
+    let mut admitting = use_signal(|| false);
+    // 编辑器模式：?editor=lexical 走 Lexical Island（A+ Phase 1 挂载 PoC），默认 textarea。
+    let editor_mode_lexical = web_sys::window()
+        .map(|window| window.location().search().unwrap_or_default().contains("editor=lexical"))
+        .unwrap_or(false);
+
+    // island 事件桥：JS Island 发 CustomEvent('bh-island-event')，这里监听并驱动台账。
+    // 闭包 forget 存活整个应用生命周期（PoC 无 close 路径；FM18 语义属 Runtime）。
+    use_effect(move || {
+        let state = state.clone();
+        let counter = counter.clone();
+        let admitting = admitting.clone();
+        let closure = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |event: web_sys::CustomEvent| {
+            let detail = event.detail().as_string().unwrap_or_default();
+            if detail.contains("submit-request") {
+                do_submit(state.clone(), counter.clone(), admitting.clone());
+            }
+        });
+        let window = web_sys::window().expect("no window");
+        window
+            .add_event_listener_with_callback("bh-island-event", closure.as_ref().unchecked_ref())
+            .unwrap();
+        closure.forget(); // 应用生命周期存续
+    });
 
     let draft_text = state.read().draft.snapshot.text.clone();
     let draft_empty = !state.read().draft.snapshot.has_content();
@@ -137,7 +175,22 @@ fn app() -> Element {
     rsx! {
         div { class: "panel",
             h1 { "chat-composer · Rust 面板" }
-            textarea {
+            if editor_mode_lexical {
+                // Lexical Island 容器：Dioxus 只拥有容器，内部 DOM 归 Lexical（计划 §4.4）。
+                div {
+                    id: "lexical-island-container",
+                    class: "editor",
+                    onmounted: move |_| {
+                        // island.js（vanilla bundle）已先行加载：window.createController 存在。
+                        spawn(async move {
+                            let _ = document::eval(
+                                "window.__islandMount = () => { window.__islandController = window.createController({ container: document.getElementById('lexical-island-container'), placeholder: '写下一条消息…（Enter 发送）', canSubmit: () => true, onEvent: (event) => window.dispatchEvent(new CustomEvent('bh-island-event', { detail: JSON.stringify(event) })) }); }; window.__islandRemount = () => { if (window.__islandController) window.__islandController.destroy(); window.__islandMount(); }; window.__islandMount();",
+                            ).await;
+                        });
+                    },
+                }
+            } else {
+                textarea {
                 class: "editor",
                 placeholder: "写下一条消息…（Enter 发送，Shift+Enter 换行）",
                 value: "{draft_text}",
@@ -172,6 +225,7 @@ fn app() -> Element {
                         _ => event.prevent_default(),
                     }
                 },
+            }
             }
             div { class: "actions",
                 button { class: "primary", onclick: move |_| do_submit(state, counter, admitting), disabled: draft_empty || admitting(), "发送" }

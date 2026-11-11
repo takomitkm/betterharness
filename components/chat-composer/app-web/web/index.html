@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>bh composer · island PoC</title>
+  <style>
+    body { font: 16px/1.6 system-ui, sans-serif; margin: 24px; }
+    .panel { max-width: 720px; margin: 0 auto; }
+    .editor { min-height: 110px; border: 1px solid #999; border-radius: 8px; padding: 8px; }
+    .outbox { list-style: none; padding: 0; }
+    .record { border-top: 1px dashed #bbb; padding: 6px 0; }
+    .lexical-island-placeholder { color: #999; }
+  </style>
+</head>
+<body>
+  <div id="main"></div>
+  <script src="island.js"></script>
+  <script type="module">
+    import init from './app_web.js';
+    init().catch((error) => { document.body.prepend('WASM init failed: ' + error); });
+  </script>
+</body>
+</html>

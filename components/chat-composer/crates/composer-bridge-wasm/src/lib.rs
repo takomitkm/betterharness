@@ -77,6 +77,11 @@ impl WasmBridge {
     pub fn pending_count(&self) -> u32 {
         self.core.pending_effect_count() as u32
     }
+
+    /// 下一次 Persist 的 CAS expected 修订（= 已成功落盘次数）。宿主在 ack 前调用。
+    pub fn persist_revision(&self) -> u32 {
+        self.core.persist_revision() as u32
+    }
 }
 
 fn now_ms() -> u64 {
