@@ -48,6 +48,9 @@ export const INDEX_HTML = String.raw`<!DOCTYPE html>
     .editor { min-height: 110px; border: 1px solid #999; border-radius: 8px; padding: 8px; }
     .outbox { list-style: none; padding: 0; }
     .record { border-top: 1px dashed #bbb; padding: 6px 0; }
+    .candidate-menu { list-style: none; margin: 4px 0 0; padding: 4px; border: 1px solid #bbb; border-radius: 8px; background: #fff; max-width: 360px; }
+    .candidate { padding: 4px 8px; border-radius: 4px; cursor: pointer; }
+    .candidate.highlighted { background: #e2f0e9; }
     .lexical-island-placeholder { color: #999; }
   </style>
 </head>

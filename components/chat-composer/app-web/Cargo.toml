@@ -20,6 +20,7 @@ desktop = ["dioxus/desktop"]
 dioxus = { version = "0.7" }
 composer-core = { path = "../crates/composer-core" }
 composer-keynav = { path = "../crates/composer-keynav" }
+composer-completion = { path = "../crates/composer-completion" }
 composer-host = { path = "../crates/composer-host" }
 composer-runtime = { path = "../crates/composer-runtime" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

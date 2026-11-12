@@ -31,11 +31,11 @@ use futures_util::StreamExt;
 use Modifiers as KeyModifiers;
 
 // web（wasm32）专有 interop：desktop 原生构建不编译这些依赖（见 Cargo.toml target 门控）。
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use taino_edit_dioxus::{EditorState, TainoEditor, ViewPlugins};
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen::prelude::{wasm_bindgen, Closure};
+use wasm_bindgen::prelude::{wasm_bindgen, Closure, JsValue};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 
@@ -86,8 +86,8 @@ fn trace_state(state: &ScopeState) {
 #[cfg(feature = "desktop")]
 fn autoplay(events: &Coroutine<Event>) {
     if std::env::var("BH_DEMO_AUTOPLAY").is_ok() {
-        events.send(Event::Edit { snapshot: Snapshot::text("autoplay hello") });
-        events.send(Event::Submit);
+        events.send(AppEvent::Runtime(Event::Edit { snapshot: Snapshot::text("autoplay hello") }));
+        events.send(AppEvent::Runtime(Event::Submit));
     }
 }
 
@@ -169,6 +169,42 @@ fn doc_plain_text(doc: &taino_edit_dioxus::Node) -> String {
     parts.join("\n")
 }
 
+/// 用纯文本重建 doc 内容切片（段落按 \n 切；空行 = 空段落；全空 = 单空段落）。
+#[cfg(target_arch = "wasm32")]
+fn text_slice(
+    schema: &taino_edit_dioxus::Schema,
+    text: &str,
+) -> taino_edit_dioxus::Slice {
+    let paras: Vec<_> = text
+        .split('\n')
+        .map(|line| {
+            let children: Vec<_> = if line.is_empty() {
+                Vec::new()
+            } else {
+                vec![schema.text(line, vec![]).expect("text node")]
+            };
+            schema
+                .node("paragraph", Default::default(), children, vec![])
+                .expect("paragraph")
+        })
+        .collect();
+    if paras.is_empty() {
+        let para = schema
+            .node("paragraph", Default::default(), vec![], vec![])
+            .expect("paragraph");
+        taino_edit_dioxus::Slice::new(taino_edit_core::Fragment::from_nodes(vec![para]), 0, 0)
+    } else {
+        taino_edit_dioxus::Slice::new(taino_edit_core::Fragment::from_nodes(paras), 0, 0)
+    }
+}
+
+/// 当前文档内容尺寸（事务替换的 to 端点）。
+#[cfg(target_arch = "wasm32")]
+fn doc_content_size(editor: &Signal<EditorState>) -> usize {
+    let doc = editor.peek().doc().clone();
+    (0..doc.child_count()).map(|i| doc.child(i).node_size()).sum()
+}
+
 /// 回环执行器：Deliver 立即接纳（回执 scope 必须与配置一致——配错身份时 FM15
 /// 纪律正确兜底转 uncertain，D004 实录）。persist 为内存面：演示台账存活于
 /// 镜像 signal；真持久化见 Phase 5 的 React WASM 线（IDB + BM07 CAS）。
@@ -198,6 +234,127 @@ impl EffectExecutor for LoopbackExecutor {
     fn schedule_timeout(&mut self, _id: &MessageId, _attempt: &AttemptId, _deadline_ms: u64) {}
 
     fn cancel_timeout(&mut self, _id: &MessageId, _attempt: &AttemptId) {}
+}
+
+// ── 候选菜单（E3a：composer-completion + taino 线，TS CandidateMenu 契约同构） ──
+
+/// 应用层事件：Runtime 事件 + 菜单键事件（菜单开着时键路由归菜单）。
+#[derive(Clone, Debug)]
+enum AppEvent {
+    Runtime(Event),
+    Menu(MenuAction),
+}
+
+/// 菜单开着时的键动作（KD has_menu 契约的 E2E 面）。
+#[derive(Clone, Copy, Debug)]
+enum MenuAction {
+    Up,
+    Down,
+    Accept,
+    Dismiss,
+}
+
+/// 菜单 UI 视图（session 状态的只读投影）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MenuView {
+    items: Vec<String>,
+    highlight: usize,
+}
+
+/// 演示候选源（TS demo 同款）：@ 文件引用、/ 命令回显。生产宿主在此接真实检索。
+fn demo_provider(
+    kind: composer_completion::TriggerKind,
+    query: &str,
+) -> Vec<composer_completion::Candidate> {
+    use composer_completion::{Candidate, TriggerKind};
+    let source: &[(&str, &str)] = match kind {
+        TriggerKind::Reference => &[
+            ("field-report.md", "@field-report.md"),
+            ("final-notes.md", "@final-notes.md"),
+            ("s1-alpha.md", "@s1-alpha.md"),
+            ("s2-beta.md", "@s2-beta.md"),
+            ("服务器架构.png", "@服务器架构.png"),
+        ],
+        TriggerKind::Slash => &[
+            ("/help 帮助", "/帮助"),
+            ("/clear 清理上下文", "/清理上下文"),
+        ],
+    };
+    let needle = query.to_lowercase();
+    source
+        .iter()
+        .filter(|(label, insert)| {
+            label.to_lowercase().contains(&needle) || insert.to_lowercase().contains(&needle)
+        })
+        .map(|(label, insert)| Candidate {
+            label: (*label).into(),
+            insert_text: (*insert).into(),
+        })
+        .collect()
+}
+
+/// session 状态 → 菜单 UI 投影 + menu_open 旗标同步。
+#[cfg(target_arch = "wasm32")]
+fn sync_menu_view(
+    session: &composer_completion::CompletionSession,
+    menu_view: &mut Signal<Option<MenuView>>,
+    menu_open: &Rc<Cell<bool>>,
+) {
+    menu_open.set(session.is_open());
+    *menu_view.write() = if session.is_open() && !session.is_pending() {
+        Some(MenuView {
+            items: session
+                .candidates()
+                .iter()
+                .map(|c| c.label.clone())
+                .collect(),
+            highlight: session.highlight_index().max(0) as usize,
+        })
+    } else {
+        None
+    };
+}
+
+/// DOM 选区 → 编辑器全文字符偏移（触发检测的 caret 用 char 下标；E3a）。
+#[cfg(target_arch = "wasm32")]
+fn dom_caret_char_offset() -> Option<usize> {
+    let window = web_sys::window()?;
+    let sel = window.get_selection().ok().flatten()?;
+    let range = sel.get_range_at(0).ok()?;
+    let root: web_sys::Element = window
+        .document()?
+        .query_selector("[contenteditable=\"true\"]")
+        .ok()
+        .flatten()?;
+    let anchor = range.start_container().ok()?;
+    let offset = range.start_offset().ok()? as usize;
+
+    // 深度优先累计 anchor 之前的字符数（文本节点计自身长度；到 anchor 停）。
+    fn walk(node: &web_sys::Node, anchor: &web_sys::Node, offset: usize, acc: &mut usize, found: &mut bool) {
+        if *found {
+            return;
+        }
+        if JsValue::from(node) == JsValue::from(anchor) {
+            *acc += offset;
+            *found = true;
+            return;
+        }
+        if let Some(text) = node.dyn_ref::<web_sys::Text>() {
+            *acc += text.data().chars().count();
+            return;
+        }
+        let list = node.child_nodes();
+        for i in 0..list.length() {
+            if let Some(child) = list.get(i) {
+                walk(&child, anchor, offset, acc, found);
+            }
+        }
+    }
+
+    let mut acc = 0;
+    let mut found = false;
+    walk(root.unchecked_ref(), &anchor, offset, &mut acc, &mut found);
+    if found { Some(acc) } else { None }
 }
 
 /// 状态标签，对齐 archive/ts ChatComposer 的 statusLabels。
@@ -275,9 +432,18 @@ fn app() -> Element {
     let _ = &ledger;
 
     // Composer 宿主事件循环：Host 唯一所有者。事件 → 排空 → 镜像刷新。
+    // E3a：AppEvent 分层（Runtime 事件 + 菜单键），候选会话进协程（单消费者串行）。
     let mut taino_editor_loop = taino_editor.clone();
     let taino_mode = editor_mode_taino;
-    let events = use_coroutine(move |mut rx: UnboundedReceiver<Event>| async move {
+    let mut menu_view: Signal<Option<MenuView>> = use_signal(|| None);
+    let menu_open: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let menu_open_loop = menu_open.clone();
+    let menu_view_loop = menu_view.clone();
+    let events = use_coroutine(move |mut rx: UnboundedReceiver<AppEvent>| {
+        // use_coroutine 的闭包是 FnMut：非 Copy 捕获在体内 clone，再进 async move。
+        let menu_open_loop = menu_open_loop.clone();
+        let mut menu_view_loop = menu_view_loop.clone();
+        async move {
         let mut host = ComposerHost::new(
             RuntimeConfig {
                 scope: ScopeId::new("demo/main"),
@@ -288,48 +454,124 @@ fn app() -> Element {
             PlatformClock,
             PlatformIds(0),
         );
-        while let Some(event) = rx.next().await {
-            let was_submit = matches!(event, Event::Submit);
-            host.dispatch(event);
-            ledger.set(host.state().clone());
-            admitting.set(host.is_admitting());
-            #[cfg(feature = "desktop")]
-            trace_state(host.state());
-            if was_submit && host.last_dispatch_handed_off() {
-                // FM01：交接成功 → 编辑器文本随草稿清空（交接与清空是同一次状态变更的
-                // UI 面）。taino 重建空文档（undo 栈重置——D014 已知差异）；island 走 JS。
-                if taino_mode {
-                    // FM01 事务式清空：保历史与选区映射（重建 EditorState 会让选区
-                    // 失联——后续打字反转，E1 实录）。
-                    let current = taino_editor_loop.peek().clone();
-                    let schema = current.schema().clone();
-                    let empty_para = schema
-                        .node("paragraph", Default::default(), vec![], vec![])
-                        .expect("empty paragraph");
-                    let size: usize = (0..current.doc().child_count())
-                        .map(|i| current.doc().child(i).node_size())
-                        .sum();
-                    let mut tx = current.tr();
-                    tx.transform()
-                        .replace(
-                            0,
-                            size,
-                            taino_edit_dioxus::Slice::new(
-                                taino_edit_core::Fragment::from_nodes(vec![empty_para]),
-                                0,
-                                0,
-                            ),
-                            &schema,
-                        )
-                        .expect("clear replace");
-                    let next = current.apply(tx);
-                    taino_editor_loop.set(next);
-                } else {
-                    global_eval("window.__islandController && window.__islandController.clear()");
+        let mut session = composer_completion::CompletionSession::new();
+        while let Some(ev) = rx.next().await {
+            match ev {
+                AppEvent::Runtime(event) => {
+                    let was_submit = matches!(event, Event::Submit);
+                    let was_edit = matches!(event, Event::Edit { .. });
+                    host.dispatch(event);
+                    ledger.set(host.state().clone());
+                    admitting.set(host.is_admitting());
+                    #[cfg(feature = "desktop")]
+                    trace_state(host.state());
+                    if was_submit && host.last_dispatch_handed_off() {
+                        // FM01：交接成功 → 编辑器文本随草稿清空（交接与清空是同一次状态变更的
+                        // UI 面）。taino 重建空文档（undo 栈重置——D014 已知差异）；island 走 JS。
+                        if taino_mode {
+                            // FM01 事务式清空：保历史与选区映射（重建 EditorState 会让选区
+                            // 失联——后续打字反转，E1 实录）。
+                            let current = taino_editor_loop.peek().clone();
+                            let schema = current.schema().clone();
+                            let empty_para = schema
+                                .node("paragraph", Default::default(), vec![], vec![])
+                                .expect("empty paragraph");
+                            let size: usize = (0..current.doc().child_count())
+                                .map(|i| current.doc().child(i).node_size())
+                                .sum();
+                            let mut tx = current.tr();
+                            tx.transform()
+                                .replace(
+                                    0,
+                                    size,
+                                    taino_edit_dioxus::Slice::new(
+                                        taino_edit_core::Fragment::from_nodes(vec![empty_para]),
+                                        0,
+                                        0,
+                                    ),
+                                    &schema,
+                                )
+                                .expect("clear replace");
+                            let next = current.apply(tx);
+                            taino_editor_loop.set(next);
+                        } else {
+                            global_eval("window.__islandController && window.__islandController.clear()");
+                        }
+                    }
+                    // E3a 菜单联动：Submit → dismiss（提交关菜单）；Edit → 触发检测 + 候选。
+                    #[cfg(target_arch = "wasm32")]
+                    if taino_mode {
+                        if was_submit {
+                            session.dismiss();
+                            sync_menu_view(&session, &mut menu_view_loop, &menu_open_loop);
+                        } else if was_edit {
+                            let text = host.state().draft.snapshot.text.clone();
+                            let caret = dom_caret_char_offset().unwrap_or(0);
+                            let hit = composer_completion::detect_trigger(&text, caret);
+                            let rev = host.state().draft.revision;
+                            session.track(hit, rev);
+                            if session.is_pending() {
+                                if let Some(hit) = session.hit().cloned() {
+                                    let candidates = demo_provider(hit.kind, &hit.query);
+                                    session.apply_candidates(session.generation(), candidates);
+                                }
+                            }
+                            sync_menu_view(&session, &mut menu_view_loop, &menu_open_loop);
+                        }
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _ = (was_submit, was_edit);
+                }
+                AppEvent::Menu(action) => {
+                    #[cfg(target_arch = "wasm32")]
+                    if taino_mode {
+                        match action {
+                            MenuAction::Up => {
+                                session.move_highlight(-1);
+                                sync_menu_view(&session, &mut menu_view_loop, &menu_open_loop);
+                            }
+                            MenuAction::Down => {
+                                session.move_highlight(1);
+                                sync_menu_view(&session, &mut menu_view_loop, &menu_open_loop);
+                            }
+                            MenuAction::Accept => {
+                                if let Some(pick) = session.accept() {
+                                    // pick：全文按 [start,end) 替换 → 事务重建内容
+                                    let text = host.state().draft.snapshot.text.clone();
+                                    let hit = composer_completion::TriggerHit {
+                                        kind: pick.kind,
+                                        query: pick.query,
+                                        start: pick.start,
+                                        end: pick.end,
+                                    };
+                                    let (new_text, _caret) = composer_completion::apply_pick_to_text(
+                                        &text,
+                                        &hit,
+                                        &pick.candidate.insert_text,
+                                    );
+                                    let schema = taino_editor_loop.peek().schema().clone();
+                                    let size = doc_content_size(&taino_editor_loop);
+                                    let mut tx = taino_editor_loop.peek().tr();
+                                    tx.transform()
+                                        .replace(0, size, text_slice(&schema, &new_text), &schema)
+                                        .expect("pick replace");
+                                    let next = taino_editor_loop.peek().apply(tx);
+                                    taino_editor_loop.set(next);
+                                }
+                                session.dismiss();
+                                sync_menu_view(&session, &mut menu_view_loop, &menu_open_loop);
+                            }
+                            MenuAction::Dismiss => {
+                                session.dismiss();
+                                sync_menu_view(&session, &mut menu_view_loop, &menu_open_loop);
+                            }
+                        }
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _ = (action, &session);
                 }
             }
-            #[cfg(not(target_arch = "wasm32"))]
-            let _ = was_submit;
+        }
         }
     });
 
@@ -344,10 +586,10 @@ fn app() -> Element {
                 return;
             };
             match payload.get("type").and_then(|value| value.as_str()) {
-                Some("submit-request") => tx.send(Event::Submit),
+                Some("submit-request") => tx.send(AppEvent::Runtime(Event::Submit)),
                 Some("document-changed") => {
                     if let Some(text) = payload.get("text").and_then(|value| value.as_str()) {
-                        tx.send(Event::Edit { snapshot: Snapshot::text(text) });
+                        tx.send(AppEvent::Runtime(Event::Edit { snapshot: Snapshot::text(text) }));
                     }
                 }
                 _ => {}
@@ -375,7 +617,7 @@ fn app() -> Element {
         use_effect(move || {
             let doc_text = doc_plain_text(taino_editor.read().doc());
             if taino_active {
-                events.send(Event::Edit { snapshot: Snapshot::text(doc_text) });
+                events.send(AppEvent::Runtime(Event::Edit { snapshot: Snapshot::text(doc_text) }));
             }
         });
     }
@@ -386,12 +628,24 @@ fn app() -> Element {
     let taino_keymap = {
         let ime = ime.clone();
         let mut tx = events.clone();
+        let menu_open_enter = menu_open.clone();
+        let menu_open_up = menu_open.clone();
+        let menu_open_down = menu_open.clone();
+        let menu_open_esc = menu_open.clone();
+        let tx_up = tx.clone();
+        let tx_down = tx.clone();
+        let tx_esc = tx.clone();
         taino_edit_dioxus::KeymapProp::new(taino_edit_dioxus::Keymap::new(
             false,
             vec![
                 (
                     "Enter",
                     Box::new(move |_state, _dispatch| {
+                        // E3a：菜单开着 → Enter 接受候选（不提交，KD has_menu 契约）。
+                        if menu_open_enter.get() {
+                            tx.send(AppEvent::Menu(MenuAction::Accept));
+                            return true;
+                        }
                         let now = PlatformClock.now_ms();
                         let snapshot = {
                             let guard = ime.borrow();
@@ -409,14 +663,59 @@ fn app() -> Element {
                             now_ms: now as i64,
                             composing: false,
                             composing_until_ms: snapshot.1 as i64,
-                            has_menu: false,
+                            has_menu: menu_open_enter.get(),
                             can_submit: true, // 演示恒可提交；空草稿由 Runtime FD06 兜底
                         });
                         if matches!(verdict.kind, composer_keynav::VerdictKind::Submit) {
-                            tx.send(Event::Submit);
+                            tx.send(AppEvent::Runtime(Event::Submit));
                         }
                         true
                     }),
+                ),
+                (
+                    "ArrowUp",
+                    Box::new(move |_s, _d| {
+                        if menu_open_up.get() {
+                            tx_up.send(AppEvent::Menu(MenuAction::Up));
+                            true
+                        } else {
+                            false // 无菜单：光标移动归编辑器
+                        }
+                    }),
+                ),
+                (
+                    "ArrowDown",
+                    Box::new(move |_s, _d| {
+                        if menu_open_down.get() {
+                            tx_down.send(AppEvent::Menu(MenuAction::Down));
+                            true
+                        } else {
+                            false
+                        }
+                    }),
+                ),
+                (
+                    "Escape",
+                    Box::new(move |_s, _d| {
+                        if menu_open_esc.get() {
+                            tx_esc.send(AppEvent::Menu(MenuAction::Dismiss));
+                            true
+                        } else {
+                            false
+                        }
+                    }),
+                ),
+                (
+                    "Backspace",
+                    Box::new(|s, d| taino_edit_core::delete_backward(s, d)),
+                ),
+                (
+                    "Delete",
+                    Box::new(|s, d| taino_edit_core::delete_forward(s, d)),
+                ),
+                (
+                    "Shift-Enter",
+                    Box::new(|s, d| taino_edit_core::split_block(s, d)),
                 ),
                 ("Mod-z", Box::new(|s, d| taino_edit_extensions::undo_command()(s, d))),
             ],
@@ -461,6 +760,24 @@ fn app() -> Element {
                         plugins: taino_edit_dioxus::ViewPlugins::new(vec![]),
                     }
                 }
+                // E3a 候选菜单（TS CandidateMenu 契约同构：role=listbox + aria）。
+                if let Some(view) = menu_view.read().as_ref() {
+                    ul {
+                        class: "candidate-menu",
+                        "role": "listbox",
+                        "data-testid": "candidate-menu",
+                        for (index, label) in view.items.iter().enumerate() {
+                            li {
+                                key: "{index}",
+                                "role": "option",
+                                "aria-selected": "{index == view.highlight}",
+                                "data-index": "{index}",
+                                class: if index == view.highlight { "candidate highlighted" } else { "candidate" },
+                                "{label}"
+                            }
+                        }
+                    }
+                }
             } else if editor_mode_lexical {
                 // Lexical Island 容器：Dioxus 只拥有容器，内部 DOM 归 Lexical（计划 §4.4）。
                 div {
@@ -495,7 +812,7 @@ fn app() -> Element {
                     });
                 },
                 oninput: move |event| {
-                    events.send(Event::Edit { snapshot: Snapshot::text(event.value()) });
+                    events.send(AppEvent::Runtime(Event::Edit { snapshot: Snapshot::text(event.value()) }));
                 },
                 onkeydown: move |event| {
                     let data = event.data();
@@ -518,7 +835,7 @@ fn app() -> Element {
                         ..Default::default()
                     });
                     match decision.kind {
-                        composer_keynav::VerdictKind::Submit => events.send(Event::Submit),
+                        composer_keynav::VerdictKind::Submit => events.send(AppEvent::Runtime(Event::Submit)),
                         composer_keynav::VerdictKind::Newline => {
                             // 换行交给浏览器默认行为：不 preventDefault，textarea 自行插入。
                         }
@@ -528,12 +845,12 @@ fn app() -> Element {
             }
             }
             div { class: "actions",
-                button { class: "primary", onclick: move |_| events.send(Event::Submit), disabled: draft_empty || admitting(), "发送" }
+                button { class: "primary", onclick: move |_| events.send(AppEvent::Runtime(Event::Submit)), disabled: draft_empty || admitting(), "发送" }
                 button {
                     "data-testid": "end-turn",
                     onclick: move |_| {
                         if let Some(turn) = ledger.read().active_turn.clone() {
-                            events.send(Event::EndTurn(turn));
+                            events.send(AppEvent::Runtime(Event::EndTurn(turn)));
                         }
                     },
                     disabled: !turn_running,
@@ -560,7 +877,7 @@ fn app() -> Element {
 
 /// 单条提交记录行：id 作为 prop 进入组件，事件走协程（Phase 4：UI 不碰台账写面）。
 #[component]
-fn RecordRow(events: Coroutine<Event>, id: String, status: Status, text: String) -> Element {
+fn RecordRow(events: Coroutine<AppEvent>, id: String, status: Status, text: String) -> Element {
     let recall_id = id.clone();
     let retry_id = id.clone();
     rsx! {
@@ -568,10 +885,10 @@ fn RecordRow(events: Coroutine<Event>, id: String, status: Status, text: String)
             strong { {status_label(status)} }
             span { class: "text", "{text}" }
             if matches!(status, Status::Queued | Status::Rejected | Status::Cancelled) {
-                button { onclick: move |_| events.send(Event::Restore { id: MessageId::new(&recall_id) }), "取回编辑" }
+                button { onclick: move |_| events.send(AppEvent::Runtime(Event::Restore { id: MessageId::new(&recall_id) })), "取回编辑" }
             }
             if matches!(status, Status::Rejected) {
-                button { onclick: move |_| events.send(Event::Retry { id: MessageId::new(&retry_id) }), "原样重试" }
+                button { onclick: move |_| events.send(AppEvent::Runtime(Event::Retry { id: MessageId::new(&retry_id) })), "原样重试" }
             }
         }
     }
