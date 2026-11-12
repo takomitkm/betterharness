@@ -36,11 +36,19 @@
      用 `..Default::default()` 曾让 Enter 恒 noop（web textarea 模式同样中招）。
      演示显式 `can_submit: true`，空草稿由 Runtime FD06 兜底。
 
-## 已知项（记录不修）
+## 已知项 → 已修（2026-11-13，用户拍板「2修」）
 
 - desktop **textarea 模式**提交后草稿残留 `\n` 尾：keydown 的 prevent_default 在
   dioxus-desktop (wry) 上未阻断浏览器默认换行 + 受控值异步同步竞态。island 模式
   （主产品面）无此问题（E2E 4b ✓）。FM11 语义不受影响（快照无 \n）。
+- **修复**：JS 同步层 Enter DOM 护栏——document 级 capture 委托监听（对元素重建
+  免疫），对 textarea.editor 的非 Shift/非组合 Enter preventDefault（与 island 的
+  hand-to-ime DOM 护栏同构，D009）。注意：元素级监听（onmounted eval 内装在
+  textarea 上）曾静默失效（CDP 实录 guard:false，机理未查明），document 委托版
+  一次安装全生命周期有效。
+- **验证**：CDP 冒烟 guard:true + 2 条提交（accepted/queued FM11）+ **draft 干净
+  清空（""，此前 "second cdp msg\n"）** VERDICT PASS + island E2E 24/24 回归
+  （evidence: phase7-fix2b.log / phase7-fix2-island.log）。
 
 ## 后果
 

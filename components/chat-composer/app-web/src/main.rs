@@ -308,10 +308,17 @@ fn app() -> Element {
                 placeholder: "写下一条消息…（Enter 发送，Shift+Enter 换行）",
                 value: "{draft_text}",
                 readonly: admitting(),
-                // 桌面冒烟（SendKeys）与 web 直输的落点：挂载后聚焦输入框。
+                // 挂载后聚焦 + Enter DOM 护栏（D012 遗留项修复）：desktop 上 Dioxus 事件
+                // 走 IPC，Rust handler 的 prevent_default 追不上浏览器默认换行——护栏在
+                // JS 同步层 preventDefault（与 island 的 hand-to-ime DOM 护栏同构，D009）。
+                // document 级 capture 委托：一次安装、对元素重建免疫（元素级监听在
+                // onmounted eval 里曾静默失效——CDP 实录 guard:false）。Shift+Enter 与
+                // IME 组合中的 Enter 不拦（换行/输入法语义归浏览器）。
                 onmounted: move |_| {
                     spawn(async move {
-                        let _ = document::eval("document.querySelector('textarea.editor') && document.querySelector('textarea.editor').focus()").await;
+                        let _ = document::eval(
+                            "if (!window.__bhEnterGuard) { window.__bhEnterGuard = true; document.addEventListener('keydown', (e) => { const ta = e.target; if (ta && ta.tagName === 'TEXTAREA' && ta.classList && ta.classList.contains('editor') && e.key === 'Enter' && !e.shiftKey && !e.isComposing) e.preventDefault(); }, true); } const ta0 = document.querySelector('textarea.editor'); if (ta0) ta0.focus();",
+                        ).await;
                     });
                 },
                 oninput: move |event| {
