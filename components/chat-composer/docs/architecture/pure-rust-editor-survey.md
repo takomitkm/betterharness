@@ -69,3 +69,22 @@ placeholder、clear/setDocument/destroy**。不需要 marks/表格/Markdown。
 
 E0 结果出来后由用户拍板：Go（吃进外部依赖 + 跟随其 API 迭代）还是 fallback
 （自研可控但 IME/DOM 同步的长期维护归我们）。
+
+## 五、E0 门 1/门 2 实测结果（2026-11-13，校机）
+
+| 门 | 内容 | 结果 |
+| --- | --- | --- |
+| 1 wasm32 编译 | basic-dioxus 示例 `cargo build --target wasm32` | ✓ 1m27s 零错误 |
+| 2 真浏览器挂载 | wasm-bindgen 0.2.121 CLI + 静态服务 + CDP | ✓ MOUNT OK |
+| 2 键盘直打 | `hello taino 中文` 经真 WebView 键盘链 | ✓ 文本可见 |
+| 2 合成组合循环 | compositionstart → 打字 → compositionend | ✓ **内容零损坏**（对比裸 Lexical+合成事件炸文本） |
+| 2 页面健康 | pageerror 收集 | ✓ 零错误 |
+
+环境事实：
+- taino-edit 锁 wasm-bindgen **0.2.121**（我们的 pin 是 0.2.100）→ 校机 CLI 已装
+  0.2.121（替换 0.2.100）；集成时 app-web 的 pin 需同步升 0.2.121（composer-bridge
+  系 crate 用浮动 "0.2" 自动跟随，无冲突）
+- 校机已 clone 仓库到 /d/yzd/taino-edit（depth 1）；示例 wasm 在 workspace 根 target
+- E0 剩余：composer 形态的 Enter 仲裁接线（keydown → composer-keynav）+ FM01 草稿
+  同步 + KD03 宽限窗跑分 → Go/No-Go
+
