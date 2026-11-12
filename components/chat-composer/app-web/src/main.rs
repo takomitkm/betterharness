@@ -31,6 +31,9 @@ use futures_util::StreamExt;
 use Modifiers as KeyModifiers;
 
 // web（wasm32）专有 interop：desktop 原生构建不编译这些依赖（见 Cargo.toml target 门控）。
+use std::cell::RefCell;
+use std::rc::Rc;
+use taino_edit_dioxus::{EditorState, TainoEditor, ViewPlugins};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::{wasm_bindgen, Closure};
 #[cfg(target_arch = "wasm32")]
@@ -138,6 +141,34 @@ fn main() {
     dioxus::launch(app);
 }
 
+// ── taino 编辑器（web 专有，E1：Pure Rust Editor 替换面，D014） ─────────────
+
+/// ImeTracker：island keynav.ts 同款语义的 Rust 最小版（KD10/KD03）。
+#[derive(Default)]
+struct ImeTracker {
+    composing: bool,
+    composing_until_ms: u64,
+}
+
+impl ImeTracker {
+    fn start(&mut self) {
+        self.composing = true;
+    }
+    fn end(&mut self, now_ms: u64) {
+        self.composing = false;
+        self.composing_until_ms = now_ms + 10; // KD03：10ms 宽限窗
+    }
+}
+
+/// doc 多段落按 \n 连接（Node::text_content 不加块分隔——E1 实录）。
+fn doc_plain_text(doc: &taino_edit_dioxus::Node) -> String {
+    let mut parts = Vec::new();
+    for i in 0..doc.child_count() {
+        parts.push(doc.child(i).text_content());
+    }
+    parts.join("\n")
+}
+
 /// 回环执行器：Deliver 立即接纳（回执 scope 必须与配置一致——配错身份时 FM15
 /// 纪律正确兜底转 uncertain，D004 实录）。persist 为内存面：演示台账存活于
 /// 镜像 signal；真持久化见 Phase 5 的 React WASM 线（IDB + BM07 CAS）。
@@ -196,6 +227,44 @@ fn app() -> Element {
         .unwrap_or(false);
     #[cfg(not(target_arch = "wasm32"))]
     let editor_mode_lexical = false;
+    // 编辑器模式：?editor=taino 走 Pure Rust Editor（E1，D014）。
+    #[cfg(target_arch = "wasm32")]
+    let editor_mode_taino = web_sys::window()
+        .map(|window| window.location().search().unwrap_or_default().contains("editor=taino"))
+        .unwrap_or(false);
+    #[cfg(not(target_arch = "wasm32"))]
+    let editor_mode_taino = false;
+
+    // taino 编辑器状态（textarea/island 模式下闲置；desktop 上分支不渲染）。
+    let mut taino_editor: Signal<taino_edit_dioxus::EditorState> = use_signal(|| {
+        let base = taino_edit_dioxus::SchemaBuilder::new()
+            .node(
+                "doc",
+                taino_edit_dioxus::NodeSpec {
+                    content: Some("block+".into()),
+                    ..Default::default()
+                },
+            )
+            .node(
+                "text",
+                taino_edit_dioxus::NodeSpec {
+                    group: Some("inline".into()),
+                    ..Default::default()
+                },
+            );
+        let exts: [&'static dyn taino_edit_extensions::Extension; 1] =
+            [&taino_edit_extensions::Paragraph];
+        let schema = taino_edit_extensions::build_schema_with(base, &exts, "doc").expect("schema");
+        let para = schema
+            .node("paragraph", Default::default(), vec![], vec![])
+            .expect("empty paragraph");
+        let doc = schema
+            .node("doc", Default::default(), vec![para], vec![])
+            .expect("doc");
+        EditorState::new(doc, schema)
+    });
+    // ImeTracker：组合事件在 taino 内部消化，宿主用根级监听拿状态（island 同款，KD10）。
+    let ime = use_hook(|| Rc::new(RefCell::new(ImeTracker::default())));
 
     // 台账镜像随渲染刷新（web 测试钩子 composer_view_json 的数据面；read 同时订阅渲染）。
     #[cfg(target_arch = "wasm32")]
@@ -206,6 +275,8 @@ fn app() -> Element {
     let _ = &ledger;
 
     // Composer 宿主事件循环：Host 唯一所有者。事件 → 排空 → 镜像刷新。
+    let mut taino_editor_loop = taino_editor.clone();
+    let taino_mode = editor_mode_taino;
     let events = use_coroutine(move |mut rx: UnboundedReceiver<Event>| async move {
         let mut host = ComposerHost::new(
             RuntimeConfig {
@@ -224,10 +295,38 @@ fn app() -> Element {
             admitting.set(host.is_admitting());
             #[cfg(feature = "desktop")]
             trace_state(host.state());
-            #[cfg(target_arch = "wasm32")]
             if was_submit && host.last_dispatch_handed_off() {
-                // 交接成功 → island 文本随草稿清空（交接与清空是同一次状态变更的 UI 面）。
-                global_eval("window.__islandController && window.__islandController.clear()");
+                // FM01：交接成功 → 编辑器文本随草稿清空（交接与清空是同一次状态变更的
+                // UI 面）。taino 重建空文档（undo 栈重置——D014 已知差异）；island 走 JS。
+                if taino_mode {
+                    // FM01 事务式清空：保历史与选区映射（重建 EditorState 会让选区
+                    // 失联——后续打字反转，E1 实录）。
+                    let current = taino_editor_loop.peek().clone();
+                    let schema = current.schema().clone();
+                    let empty_para = schema
+                        .node("paragraph", Default::default(), vec![], vec![])
+                        .expect("empty paragraph");
+                    let size: usize = (0..current.doc().child_count())
+                        .map(|i| current.doc().child(i).node_size())
+                        .sum();
+                    let mut tx = current.tr();
+                    tx.transform()
+                        .replace(
+                            0,
+                            size,
+                            taino_edit_dioxus::Slice::new(
+                                taino_edit_core::Fragment::from_nodes(vec![empty_para]),
+                                0,
+                                0,
+                            ),
+                            &schema,
+                        )
+                        .expect("clear replace");
+                    let next = current.apply(tx);
+                    taino_editor_loop.set(next);
+                } else {
+                    global_eval("window.__islandController && window.__islandController.clear()");
+                }
             }
             #[cfg(not(target_arch = "wasm32"))]
             let _ = was_submit;
@@ -268,6 +367,62 @@ fn app() -> Element {
         autoplay(&events);
     });
 
+    // taino 文本同步：编辑器模型文档 → Runtime 草稿。编辑态唯一事实在 taino state，
+    // 模型变更即草稿变更（E1：替代 island 的 document-changed 桥）。非 taino 模式下
+    // taino_editor 永不变更 → effect 只在挂载跑一次 → 不发事件。
+    {
+        let taino_active = editor_mode_taino;
+        use_effect(move || {
+            let doc_text = doc_plain_text(taino_editor.read().doc());
+            if taino_active {
+                events.send(Event::Edit { snapshot: Snapshot::text(doc_text) });
+            }
+        });
+    }
+
+    // taino Enter 仲裁 keymap：composer-keynav 裁决 → Submit 进协程；
+    // 组合中/宽限窗内不提交（island 的 DOM 护栏语义同构，D009/D014）。
+    // History 的 undo 绑定一并挂上（Mod-z）。
+    let taino_keymap = {
+        let ime = ime.clone();
+        let mut tx = events.clone();
+        taino_edit_dioxus::KeymapProp::new(taino_edit_dioxus::Keymap::new(
+            false,
+            vec![
+                (
+                    "Enter",
+                    Box::new(move |_state, _dispatch| {
+                        let now = PlatformClock.now_ms();
+                        let snapshot = {
+                            let guard = ime.borrow();
+                            (guard.composing, guard.composing_until_ms)
+                        };
+                        let verdict = decide_enter(&EnterDecisionInput {
+                            key: "Enter".into(),
+                            shift_key: false,
+                            alt_key: false,
+                            ctrl_key: false,
+                            meta_key: false,
+                            is_composing: snapshot.0,
+                            key_code: None,
+                            repeat: false,
+                            now_ms: now as i64,
+                            composing: false,
+                            composing_until_ms: snapshot.1 as i64,
+                            has_menu: false,
+                            can_submit: true, // 演示恒可提交；空草稿由 Runtime FD06 兜底
+                        });
+                        if matches!(verdict.kind, composer_keynav::VerdictKind::Submit) {
+                            tx.send(Event::Submit);
+                        }
+                        true
+                    }),
+                ),
+                ("Mod-z", Box::new(|s, d| taino_edit_extensions::undo_command()(s, d))),
+            ],
+        ))
+    };
+
     let draft_text = ledger.read().draft.snapshot.text.clone();
     let draft_empty = !ledger.read().draft.snapshot.has_content();
     let turn_running = ledger.read().active_turn.is_some();
@@ -285,10 +440,28 @@ fn app() -> Element {
         })
         .collect();
 
+    // taino 组合监听句柄。
+    let ime_start = ime.clone();
+    let ime_end = ime.clone();
+
     rsx! {
         div { class: "panel",
             h1 { "chat-composer · Rust 面板" }
-            if editor_mode_lexical {
+            if editor_mode_taino {
+                // taino 编辑器（E1）：Dioxus 组件直挂——无 island.js 容器装载，
+                // DOM 所有权归 taino 的 diff/patch 桥（计划 §4.4 同款纪律）。
+                // desktop 上 editor_mode_taino 恒 false，本分支不渲染（依赖为编译桩）。
+                div {
+                    class: "editor",
+                    oncompositionstart: move |_| ime_start.borrow_mut().start(),
+                    oncompositionend: move |_| ime_end.borrow_mut().end(PlatformClock.now_ms()),
+                    TainoEditor {
+                        state: taino_editor,
+                        keymap: taino_keymap,
+                        plugins: taino_edit_dioxus::ViewPlugins::new(vec![]),
+                    }
+                }
+            } else if editor_mode_lexical {
                 // Lexical Island 容器：Dioxus 只拥有容器，内部 DOM 归 Lexical（计划 §4.4）。
                 div {
                     id: "lexical-island-container",
