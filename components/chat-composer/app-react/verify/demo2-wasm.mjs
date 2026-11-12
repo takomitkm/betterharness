@@ -6,7 +6,12 @@ import { chromium } from 'playwright-core';
 import { startDemoServer } from './demo-server.mjs';
 
 const server = await startDemoServer();
-const browser = await chromium.launch({ channel: process.env.CE_BROWSER_CHANNEL || 'msedge', headless: true });
+// CI（ubuntu runner）无 msedge：CE_BROWSER_CHANNEL=chromium → bundled chromium。
+const launchChannel = () => {
+  const channel = process.env.CE_BROWSER_CHANNEL;
+  return channel && channel !== "chromium" ? channel : undefined;
+};
+const browser = await chromium.launch({ channel: launchChannel(), headless: true });
 const page = await (await browser.newContext()).newPage();
 const errors = [];
 page.on('pageerror', (error) => { errors.push(String(error)); console.log('[pageerror]', String(error).slice(0, 300)); });

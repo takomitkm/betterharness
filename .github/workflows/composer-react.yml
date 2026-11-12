@@ -1,0 +1,76 @@
+# chat-composer React WASM 线 CI（workflow_dispatch 手动跑——仓库约定）。
+# 与 composer.yml 的差异：另一条构建链（bridge-wasm pkg + app-react npm + esbuild demo）
+# + demo-server 回环 fixture + IDB reload 断言（scope 隔离跨 run 持久）。
+name: composer-react
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: composer-react-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CE_BROWSER_CHANNEL: chromium
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (stable + wasm32)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            components/chat-composer/target
+          key: composer-react-${{ runner.os }}-cargo-${{ hashFiles('components/chat-composer/**/Cargo.lock', 'components/chat-composer/**/Cargo.toml') }}
+          restore-keys: composer-react-${{ runner.os }}-cargo-
+
+      - name: wasm-bindgen-cli 0.2.130
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.130
+
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Bridge wasm build + bindgen
+        working-directory: components/chat-composer/crates/composer-bridge-wasm
+        run: |
+          cargo build --release --target wasm32-unknown-unknown
+          wasm-bindgen --target web --out-dir pkg --out-name composer_bridge_wasm \
+            ../../target/wasm32-unknown-unknown/release/composer_bridge_wasm.wasm
+
+      - name: app-react deps + typecheck + build demo
+        working-directory: components/chat-composer/app-react
+        run: |
+          npm install --no-audit --no-fund
+          npm run typecheck
+          npm run build:demo
+          mkdir -p vendor
+          cp ../../crates/composer-bridge-wasm/pkg/composer_bridge_wasm.js vendor/
+          cp ../../crates/composer-bridge-wasm/pkg/composer_bridge_wasm_bg.wasm vendor/
+
+      - name: Playwright chromium
+        working-directory: components/chat-composer/app-react
+        run: |
+          npm install playwright-core --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      - name: E2E — demo2-wasm（IDB 持久化 + reload 恢复，12 判据 ×2 轮）
+        working-directory: components/chat-composer/app-react
+        run: node verify/demo2-wasm.mjs
