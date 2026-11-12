@@ -1,0 +1,90 @@
+# chat-composer CI（A+ 仓库约定：只手动跑，workflow_dispatch）。
+# 四步：workspace Rust 测试 → wasm32 构建 + bindgen → island bundle → 四套浏览器 E2E。
+# E2E 在 ubuntu runner 的 bundled chromium 上跑（CE_BROWSER_CHANNEL=chromium）；
+# 校机 Windows/msedge 仍是权威环境，本工作流是跨平台回归面。
+name: composer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: composer-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CE_BROWSER_CHANNEL: chromium
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (stable + wasm32)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            components/chat-composer/target
+          key: composer-${{ runner.os }}-cargo-${{ hashFiles('components/chat-composer/**/Cargo.lock', 'components/chat-composer/**/Cargo.toml') }}
+          restore-keys: composer-${{ runner.os }}-cargo-
+
+      - name: wasm-bindgen-cli 0.2.130
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.130
+
+      - name: Workspace Rust tests
+        working-directory: components/chat-composer
+        run: cargo test --workspace --no-fail-fast
+
+      - name: Build app-web (wasm32 + bindgen)
+        working-directory: components/chat-composer/app-web
+        run: |
+          cargo build --release --target wasm32-unknown-unknown
+          mkdir -p vendor
+          wasm-bindgen --target web --out-dir vendor --out-name app_web \
+            target/wasm32-unknown-unknown/release/app-web.wasm
+
+      - name: Lexical Island bundle
+        working-directory: components/chat-composer/lexical-island
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+          cp .runtime/island.js ../app-web/vendor/island.js
+
+      - name: Playwright chromium
+        working-directory: components/chat-composer/app-web
+        run: |
+          npm install playwright-core --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      - name: E2E — taino（编辑器基线 18）
+        working-directory: components/chat-composer/app-web/verify
+        run: node taino-e2e.mjs
+
+      - name: E2E — taino 候选菜单（14）
+        working-directory: components/chat-composer/app-web/verify
+        run: node taino-menu-e2e.mjs
+
+      - name: E2E — taino 附件（12）
+        working-directory: components/chat-composer/app-web/verify
+        run: node taino-attach-e2e.mjs
+
+      - name: E2E — island 回归（24）
+        working-directory: components/chat-composer/app-web/verify
+        run: node island-e2e.mjs
+
+      - name: E2E 汇总
+        if: always()
+        run: echo "四套 E2E 步骤结论见上；任一非零即本 run 失败"

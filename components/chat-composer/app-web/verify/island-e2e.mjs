@@ -5,6 +5,12 @@ import { readFile, writeFile, mkdir, cp } from "node:fs/promises";
 import { chromium } from "playwright-core";
 import { startStaticServer, INDEX_HTML } from "./static-server.mjs";
 
+// CI（ubuntu runner）无 msedge：CE_BROWSER_CHANNEL=chromium → bundled chromium。
+const launchChannel = () => {
+  const channel = process.env.CE_BROWSER_CHANNEL;
+  return channel && channel !== "chromium" ? channel : undefined;
+};
+
 const distRoot = new URL("./dist/", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
 await mkdir(distRoot, { recursive: true });
 // 递归复制整个 vendor 目录（含 snippets/ 等 Dioxus web 必需资产）到 dist/。
@@ -12,7 +18,7 @@ await cp(new URL("../vendor/", import.meta.url).pathname.replace(/^\/([A-Za-z]:)
 await writeFile(distRoot + "index.html", INDEX_HTML);
 
 const server = await startStaticServer(distRoot);
-const browser = await chromium.launch({ channel: process.env.CE_BROWSER_CHANNEL || "msedge", headless: true });
+const browser = await chromium.launch({ channel: launchChannel(), headless: true });
 const page = await (await browser.newContext()).newPage();
 const errors = [];
 page.on("pageerror", (error) => { errors.push(String(error)); console.log("[pageerror]", String(error).slice(0, 200)); });

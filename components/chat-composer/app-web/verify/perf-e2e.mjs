@@ -5,13 +5,19 @@ import { chromium } from 'playwright-core';
 import { startStaticServer, INDEX_HTML } from './static-server.mjs';
 import { writeFile, mkdir, cp } from 'node:fs/promises';
 
+// CI（ubuntu runner）无 msedge：CE_BROWSER_CHANNEL=chromium → bundled chromium。
+const launchChannel = () => {
+  const channel = process.env.CE_BROWSER_CHANNEL;
+  return channel && channel !== "chromium" ? channel : undefined;
+};
+
 const distRoot = new URL('./dist/', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
 await mkdir(distRoot, { recursive: true });
 await cp(new URL("../vendor/", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"), distRoot, { recursive: true });
 await writeFile(distRoot + "index.html", INDEX_HTML);
 
 const server = await startStaticServer(distRoot);
-const browser = await chromium.launch({ channel: process.env.CE_BROWSER_CHANNEL || 'msedge', headless: true });
+const browser = await chromium.launch({ channel: launchChannel(), headless: true });
 const context = await browser.newContext();
 const errors = [];
 
