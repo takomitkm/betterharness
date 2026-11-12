@@ -1325,17 +1325,27 @@ Rust 编辑器必须同时满足：
 
 # 十三、实施阶段与验收顺序
 
-| 阶段      | 交付                         | 主要验收                       |
-| ------- | -------------------------- | -------------------------- |
-| Phase 0 | 迁移审计和基线报告                  | 工作树和测试状态明确                 |
-| Phase 1 | Lexical Vanilla Controller | 不依赖 React，原有关键测试通过         |
-| Phase 2 | Dioxus 产品 UI               | 主 UI 由 Rust 实现             |
-| Phase 3 | Dioxus + Lexical 集成        | IME、Selection、Clipboard 通过 |
-| Phase 4 | Rust Core Adapter          | Submit → Outbox Accepted   |
-| Phase 5 | IndexedDB 持久化              | 真持久化、CAS 和恢复通过             |
-| Phase 6 | Dioxus Desktop             | Native Core，系统 WebView 运行  |
-| Phase 7 | 全量回归                       | 跨 Host 行为一致，性能合格           |
-| Future  | Pure Rust Editor           | 满足准入条件后替换 Lexical          |
+| 阶段      | 交付                         | 主要验收                       | 状态 |
+| ------- | -------------------------- | -------------------------- | --- |
+| Phase 0 | 迁移审计和基线报告                  | 工作树和测试状态明确                 | ✓ 2026-11-12 |
+| Phase 1 | Lexical Vanilla Controller | 不依赖 React，原有关键测试通过         | ✓ 14/14 + 8/8 |
+| Phase 2 | Dioxus 产品 UI               | 主 UI 由 Rust 实现             | ✓ Go（phase2-gonogo） |
+| Phase 3 | Dioxus + Lexical 集成        | IME、Selection、Clipboard 通过 | ✓ 24/24（OUT-008） |
+| Phase 4 | Rust Core Adapter          | Submit → Outbox Accepted   | ✓ composer-host 10/10（OUT-010） |
+| Phase 5 | IndexedDB 持久化              | 真持久化、CAS 和恢复通过             | ✓ 12/12×2（OUT-009） |
+| Phase 6 | Dioxus Desktop             | Native Core，系统 WebView 运行  | ✓ CDP 冒烟（OUT-011） |
+| Phase 7 | 全量回归                       | 跨 Host 行为一致，性能合格           | ✓ D013 对拍 + D016 性能双模对等 |
+| E0–E2   | Pure Rust Editor（taino-edit） | 判据 9/9 + 集成 18/18 + 性能对等   | ✓ 2026-11-13（D014–D016） |
+
+E 线（Pure Rust Editor）补充说明（2026-11-13，D014–D017）：
+
+- `?editor=taino` 为 web 产品形态：taino-edit 直挂 Dioxus 组件，Enter 仲裁接
+  composer-keynav（KD 契约），FM01 事务式清空，History undo；island（Lexical）
+  保留为 fallback（24/24 回归）。
+- 性能与 Lexical 双模对等（perf-e2e.mjs：逐键/提交/长文档四指标差值在 CDP 噪声内）。
+- 上游贡献：taino-edit 选区失联根因实锤 + 修复 PR
+  [juanma-dev/taino-edit#24](https://github.com/juanma-dev/taino-edit/pull/24)
+  （附 B/C 候选分支）；desktop 切 taino 依赖上游 dioxus-desktop 适配器（D016 边界）。
 
 必须先过 Phase 1，才允许大规模迁移产品 UI。
 
