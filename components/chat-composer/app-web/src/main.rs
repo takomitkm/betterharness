@@ -198,6 +198,24 @@ fn text_slice(
     }
 }
 
+/// 扩展名 → MIME（demo 面够用的白名单；未知走 octet-stream）。
+#[cfg(target_arch = "wasm32")]
+fn mime_from_ext(name: &str) -> String {
+    let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "txt" | "md" => "text/plain",
+        "mp4" => "video/mp4",
+        "mp3" => "audio/mpeg",
+        _ => "application/octet-stream",
+    }
+    .into()
+}
+
 /// 当前文档内容尺寸（事务替换的 to 端点）。
 #[cfg(target_arch = "wasm32")]
 fn doc_content_size(editor: &Signal<EditorState>) -> usize {
@@ -243,6 +261,12 @@ impl EffectExecutor for LoopbackExecutor {
 enum AppEvent {
     Runtime(Event),
     Menu(MenuAction),
+    /// E3b：附件入库（已过 intake 守卫的 FileMeta；字节留 JS 侧，meta 进台账面）。
+    Attach(composer_intake::FileMeta),
+    /// E3b：按 AssetId 移除附件。
+    Detach(String),
+    /// E3b：附件重排（composer-reorder 语义：asset 移动到目标下标）。
+    MoveAsset { asset_id: String, target_index: f64 },
 }
 
 /// 菜单开着时的键动作（KD has_menu 契约的 E2E 面）。
@@ -369,6 +393,25 @@ fn status_label(status: Status) -> &'static str {
     }
 }
 
+/// E3b 附件资产镜像（host-owned 字节的 meta 面；字节留 JS/文件系统，从不进台账）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AssetMeta {
+    id: String,
+    name: String,
+    media_type: String,
+    bytes: u64,
+}
+
+/// E3b 演示 intake 策略（TS demo 同款量级）。
+fn demo_intake_policy() -> composer_intake::IntakePolicy {
+    composer_intake::IntakePolicy {
+        max_files: Some(8),
+        max_bytes_per_file: Some(5 * 1024 * 1024),
+        max_bytes_total: Some(20 * 1024 * 1024),
+        allowed_media_types: None, // 演示不设类型白名单；E2E 用超限大小/数量打拒绝路径
+    }
+}
+
 fn app() -> Element {
     // 台账镜像：协程在每次排空后整本刷新。UI 只读它 + 发事件（§7.5：不在 UI 复制
     // 一份拥有独立写入权的业务台账）。
@@ -437,8 +480,13 @@ fn app() -> Element {
     let taino_mode = editor_mode_taino;
     let mut menu_view: Signal<Option<MenuView>> = use_signal(|| None);
     let menu_open: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // E3b：附件资产镜像（顺序 = rail 顺序；Snapshot.attachment_ids 与之同步）。
+    let mut assets: Signal<Vec<AssetMeta>> = use_signal(Vec::new);
+    let mut intake_rejections: Signal<Vec<(String, String)>> = use_signal(Vec::new);
     let menu_open_loop = menu_open.clone();
     let menu_view_loop = menu_view.clone();
+    let mut assets_loop = assets.clone();
+    let mut rejections_loop = intake_rejections.clone();
     let events = use_coroutine(move |mut rx: UnboundedReceiver<AppEvent>| {
         // use_coroutine 的闭包是 FnMut：非 Copy 捕获在体内 clone，再进 async move。
         let menu_open_loop = menu_open_loop.clone();
@@ -460,6 +508,17 @@ fn app() -> Element {
                 AppEvent::Runtime(event) => {
                     let was_submit = matches!(event, Event::Submit);
                     let was_edit = matches!(event, Event::Edit { .. });
+                    // E3b：文本 Edit 携带的 ids 视为空（编辑器只拥有文本）——统一在此
+                    // 保留台账现 ids（附件面独立于文本，TS 线同款语义；E2E 4b 实录）。
+                    let event = match event {
+                        Event::Edit { snapshot } => Event::Edit {
+                            snapshot: composer_core::state::Snapshot {
+                                attachment_ids: host.state().draft.snapshot.attachment_ids.clone(),
+                                ..snapshot
+                            },
+                        },
+                        other => other,
+                    };
                     host.dispatch(event);
                     ledger.set(host.state().clone());
                     admitting.set(host.is_admitting());
@@ -521,6 +580,90 @@ fn app() -> Element {
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     let _ = (was_submit, was_edit);
+                }
+                AppEvent::Attach(meta) => {
+                    // E3b：intake 守卫（策略）→ meta 进镜像 → Snapshot.attachment_ids 同步。
+                    let current_assets: Vec<composer_intake::FileMeta> = assets_loop
+                        .read()
+                        .iter()
+                        .map(|a| composer_intake::FileMeta {
+                            name: a.name.clone(),
+                            media_type: a.media_type.clone(),
+                            bytes: a.bytes,
+                        })
+                        .collect();
+                    let decision = composer_intake::intake_files(
+                        &[composer_intake::FileMeta {
+                            name: meta.name.clone(),
+                            media_type: meta.media_type.clone(),
+                            bytes: meta.bytes,
+                        }],
+                        &demo_intake_policy(),
+                        &current_assets,
+                    );
+                    if let Some(&index) = decision.accepted.first() {
+                        let mut next = assets_loop.read().clone();
+                        next.push(AssetMeta {
+                            id: format!("a-{:x}-{}", PlatformClock.now_ms(), next.len()),
+                            name: meta.name.clone(),
+                            media_type: meta.media_type.clone(),
+                            bytes: meta.bytes,
+                        });
+                        let _ = index;
+                        assets_loop.set(next.clone());
+                        rejections_loop.set(Vec::new());
+                        let snapshot = composer_core::state::Snapshot {
+                            attachment_ids: next.iter().map(|a| a.id.clone()).collect(),
+                            ..host.state().draft.snapshot.clone()
+                        };
+                        host.dispatch(Event::Edit { snapshot });
+                        ledger.set(host.state().clone());
+                    } else if let Some(rejection) = decision.rejected.first() {
+                        rejections_loop.set(vec![(
+                            rejection.name.clone(),
+                            rejection.reason.as_str().to_string(),
+                        )]);
+                    }
+                }
+                AppEvent::Detach(asset_id) => {
+                    let mut next = assets_loop.read().clone();
+                    next.retain(|a| a.id != asset_id);
+                    assets_loop.set(next.clone());
+                    let snapshot = composer_core::state::Snapshot {
+                        attachment_ids: next.iter().map(|a| a.id.clone()).collect(),
+                        ..host.state().draft.snapshot.clone()
+                    };
+                    host.dispatch(Event::Edit { snapshot });
+                    ledger.set(host.state().clone());
+                }
+                AppEvent::MoveAsset { asset_id, target_index } => {
+                    // composer-reorder 纯数学：文档附件序列重排（rail 顺序 = 文档顺序）。
+                    let entries: Vec<composer_reorder::AttachmentSequenceEntry> = assets_loop
+                        .read()
+                        .iter()
+                        .map(|a| composer_reorder::AttachmentSequenceEntry {
+                            node_id: String::new(),
+                            asset_id: a.id.clone(),
+                        })
+                        .collect();
+                    if let Some(span) =
+                        composer_reorder::compute_move_span(&entries, &asset_id, target_index)
+                    {
+                        let seq = composer_reorder::apply_move_span(&entries, span);
+                        let ordered: Vec<AssetMeta> = seq
+                            .iter()
+                            .filter_map(|entry| {
+                                assets_loop.read().iter().find(|a| a.id == entry.asset_id).cloned()
+                            })
+                            .collect();
+                        assets_loop.set(ordered.clone());
+                        let snapshot = composer_core::state::Snapshot {
+                            attachment_ids: ordered.iter().map(|a| a.id.clone()).collect(),
+                            ..host.state().draft.snapshot.clone()
+                        };
+                        host.dispatch(Event::Edit { snapshot });
+                        ledger.set(host.state().clone());
+                    }
                 }
                 AppEvent::Menu(action) => {
                     #[cfg(target_arch = "wasm32")]
@@ -739,9 +882,39 @@ fn app() -> Element {
         })
         .collect();
 
-    // taino 组合监听句柄。
+    // taino 组合监听句柄 + 附件 rail 快照（E3b：避免 rsx 内裸块的语法歧义）。
     let ime_start = ime.clone();
     let ime_end = ime.clone();
+    let assets_snapshot = assets.read().clone();
+    let rejections_snapshot = intake_rejections.read().clone();
+    // E3b rail 卡片数据预构建（rsx for 体禁 let；每卡 owned，闭包各自 move）。
+    #[derive(Clone)]
+    struct RailCard {
+        index: usize,
+        name: String,
+        size_label: String,
+        // 每按钮一个 id 克隆：rsx 闭包按字段 disjoint-capture move，多闭包共享
+        // 同一 String 会 E0382（E3b 实录）。
+        id_remove: String,
+        id_back: String,
+        id_forward: String,
+        has_prev: bool,
+        has_next: bool,
+    }
+    let rail_cards: Vec<RailCard> = assets_snapshot
+        .iter()
+        .enumerate()
+        .map(|(index, a)| RailCard {
+            index,
+            name: a.name.clone(),
+            size_label: composer_intake::format_bytes(a.bytes as i64),
+            id_remove: a.id.clone(),
+            id_back: a.id.clone(),
+            id_forward: a.id.clone(),
+            has_prev: index > 0,
+            has_next: index < assets_snapshot.len() - 1,
+        })
+        .collect();
 
     rsx! {
         div { class: "panel",
@@ -777,6 +950,76 @@ fn app() -> Element {
                             }
                         }
                     }
+                }
+                // E3b 附件 rail（TS AttachmentCards 核心交互：卡片 + 移除 + 前移/后移）。
+                // 呈现增强（缩略图/灯箱/rail 翻页/object-URL 纪律）属 TS 线完整面，E3b bounded 排除。
+                if !assets_snapshot.is_empty() {
+                    div {
+                        class: "attachment-rail",
+                        "data-testid": "attachment-rail",
+                        "role": "list",
+                        for card in rail_cards.clone().into_iter() {
+                            div {
+                                key: "{card.id_remove}",
+                                class: "attachment-card",
+                                "data-testid": "attachment-card",
+                                "data-asset-id": "{card.id_remove}",
+                                span { class: "attachment-name", "{card.name}" }
+                                span { class: "attachment-meta", "{card.size_label}" }
+                                button {
+                                    "data-testid": "attachment-remove",
+                                    onclick: move |_| events.send(AppEvent::Detach(card.id_remove.clone())),
+                                    "移除"
+                                }
+                                if card.has_prev {
+                                    button {
+                                        "data-testid": "attachment-move-back",
+                                        onclick: move |_| events.send(AppEvent::MoveAsset { asset_id: card.id_back.clone(), target_index: (card.index - 1) as f64 }),
+                                        "←"
+                                    }
+                                }
+                                if card.has_next {
+                                    button {
+                                        "data-testid": "attachment-move-forward",
+                                        onclick: move |_| events.send(AppEvent::MoveAsset { asset_id: card.id_forward.clone(), target_index: (card.index + 1) as f64 }),
+                                        "→"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for rejection in rejections_snapshot.iter() {
+                    p {
+                        key: "{rejection.0}",
+                        class: "intake-rejection",
+                        "data-testid": "intake-rejection",
+                        "「{rejection.0}」未添加：{rejection.1}"
+                    }
+                }
+                input {
+                    "type": "file",
+                    "data-testid": "attachment-input",
+                    multiple: true,
+                    onchange: move |event: dioxus::prelude::Event<dioxus::prelude::FormData>| {
+                        // FileData：名字 + 异步读字节（字节 host-owned，meta 进台账——D019）。
+                        let tx = events.clone();
+                        spawn(async move {
+                            for file in event.files() {
+                                let name = file.name();
+                                let bytes_len = file
+                                    .read_bytes()
+                                    .await
+                                    .map(|data| data.len() as u64)
+                                    .unwrap_or(0);
+                                let _ = tx.send(AppEvent::Attach(composer_intake::FileMeta {
+                                    media_type: mime_from_ext(&name),
+                                    name,
+                                    bytes: bytes_len,
+                                }));
+                            }
+                        });
+                    },
                 }
             } else if editor_mode_lexical {
                 // Lexical Island 容器：Dioxus 只拥有容器，内部 DOM 归 Lexical（计划 §4.4）。

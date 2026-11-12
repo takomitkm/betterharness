@@ -51,6 +51,11 @@ export const INDEX_HTML = String.raw`<!DOCTYPE html>
     .candidate-menu { list-style: none; margin: 4px 0 0; padding: 4px; border: 1px solid #bbb; border-radius: 8px; background: #fff; max-width: 360px; }
     .candidate { padding: 4px 8px; border-radius: 4px; cursor: pointer; }
     .candidate.highlighted { background: #e2f0e9; }
+    .attachment-rail { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .attachment-card { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #bbb; border-radius: 8px; padding: 4px 8px; background: #f8f9fa; }
+    .attachment-name { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .attachment-meta { color: #777; font-size: 0.85rem; }
+    .intake-rejection { color: #b3261e; font-size: 0.9rem; margin: 4px 0 0; }
     .lexical-island-placeholder { color: #999; }
   </style>
 </head>
