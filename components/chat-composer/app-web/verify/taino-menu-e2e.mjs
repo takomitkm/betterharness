@@ -34,8 +34,10 @@ const menuVisible = () => page.evaluate(() => {
 });
 const highlighted = () => page.evaluate(() => document.querySelector(".candidate.highlighted")?.textContent ?? null);
 const freshPage = async () => {
-  // 每判据段独立加载（perf-e2e 同款隔离）：避免跨事务的选区状态耦合。
-  await page.goto(`${server.url}?editor=taino`);
+  // 每判据段独立加载：唯一 scope（E3c IDB 持久化后，freshPage 恢复上一段状态——
+  // 唯一 scope = 全新基线）。
+  const scope = `menu-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  await page.goto(`${server.url}?editor=taino&scope=${scope}`);
   await page.waitForFunction(() => window.__composerView !== undefined, { timeout: 30000 });
   await page.waitForSelector('[contenteditable="true"]', { timeout: 15000 });
   await focusEditor();

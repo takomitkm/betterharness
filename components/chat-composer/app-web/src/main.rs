@@ -126,6 +126,9 @@ impl IdGen for PlatformIds {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+mod idb;
+
 fn main() {
     // 桌面冒烟的启动标记：区分「进程没活」与「事件没进协程」。固定路径版不依赖
     // 环境变量（决定性实验：它不出现 = main 根本没跑）；cwd 版判绝对路径写失败。
@@ -226,10 +229,19 @@ fn doc_content_size(editor: &Signal<EditorState>) -> usize {
 /// 回环执行器：Deliver 立即接纳（回执 scope 必须与配置一致——配错身份时 FM15
 /// 纪律正确兜底转 uncertain，D004 实录）。persist 为内存面：演示台账存活于
 /// 镜像 signal；真持久化见 Phase 5 的 React WASM 线（IDB + BM07 CAS）。
-struct LoopbackExecutor;
+/// E3c：回环执行器 + IDB 持久化镜像（fire-and-forget；scope 键、整本 state JSON）。
+struct LoopbackExecutor {
+    scope: String,
+}
 
 impl EffectExecutor for LoopbackExecutor {
-    fn persist(&mut self, _state: &ScopeState) -> bool {
+    fn persist(&mut self, state: &ScopeState) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let json = serde_json::to_string(state).expect("ledger serializes");
+            idb::request_put(&self.scope.clone(), &json);
+        }
+        let _ = (state, &self.scope);
         true
     }
 
@@ -240,10 +252,12 @@ impl EffectExecutor for LoopbackExecutor {
         _delivery: Delivery,
         _turn: Option<&TurnId>,
     ) -> DeliveryResult {
+        // 回执 scope 必须与 RuntimeConfig.scope 一致（FM15）：写死 demo/main 会在
+        // URL scope 隔离（E3c）下配错身份 → 全部转 uncertain。
         DeliveryResult::Accepted {
             receipt: Receipt {
                 id: id.clone(),
-                scope: ScopeId::new("demo/main"),
+                scope: ScopeId::new(self.scope.clone()),
                 turn: TurnId::new(format!("turn-{id}")),
             },
         }
@@ -276,6 +290,8 @@ enum MenuAction {
     Down,
     Accept,
     Dismiss,
+    /// E3b+：鼠标悬停定位高亮（TS CandidateMenu onHighlight 同款）。
+    Hover(usize),
 }
 
 /// 菜单 UI 视图（session 状态的只读投影）。
@@ -427,6 +443,21 @@ fn app() -> Element {
         .unwrap_or(false);
     #[cfg(not(target_arch = "wasm32"))]
     let editor_mode_lexical = false;
+    // 会话 scope（E3c）：URL ?scope= 隔离多会话/多 run（IDB 键 + RuntimeConfig）；
+    // 缺省 demo/main。TS demo2-wasm 同款（scope=wasm-e2e-<ts>）。
+    #[cfg(target_arch = "wasm32")]
+    let session_scope: String = web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .and_then(|search| {
+            url::form_urlencoded::parse(search.trim_start_matches('?').as_bytes())
+                .find(|(k, _)| k == "scope")
+                .map(|(_, v)| v.into_owned())
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "demo/main".into());
+    #[cfg(not(target_arch = "wasm32"))]
+    let session_scope: String = "demo/main".into();
+
     // 编辑器模式：?editor=taino 走 Pure Rust Editor（E1，D014）。
     #[cfg(target_arch = "wasm32")]
     let editor_mode_taino = web_sys::window()
@@ -491,17 +522,53 @@ fn app() -> Element {
         // use_coroutine 的闭包是 FnMut：非 Copy 捕获在体内 clone，再进 async move。
         let menu_open_loop = menu_open_loop.clone();
         let mut menu_view_loop = menu_view_loop.clone();
+        let session_scope = session_scope.clone();
         async move {
+        // E3c FM09：先读 IDB——有持久化记录则恢复（sending→uncertain 等 Runtime 语义），
+        // 无则全新台账。
+        #[cfg(target_arch = "wasm32")]
+        let persisted = idb::get(&session_scope).await.and_then(|json| {
+            serde_json::from_str::<ScopeState>(&json)
+                .map_err(|e| web_sys::console::error_1(&format!("idb restore parse: {e}").into()))
+                .ok()
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        let persisted: Option<ScopeState> = None;
+        let scope_state = persisted.unwrap_or_else(|| {
+            ScopeState::new(
+                ScopeId::new(session_scope.clone()),
+                GenerationId::new("gen-0"),
+            )
+        });
         let mut host = ComposerHost::new(
             RuntimeConfig {
-                scope: ScopeId::new("demo/main"),
+                scope: ScopeId::new(session_scope.clone()),
                 send_timeout_ms: 1500,
             },
-            ScopeState::new(ScopeId::new("demo/main"), GenerationId::new("gen-0")),
-            LoopbackExecutor,
+            scope_state,
+            LoopbackExecutor {
+                scope: session_scope.clone(),
+            },
             PlatformClock,
             PlatformIds(0),
         );
+        // E3c FM09 配套：恢复的草稿写回 taino 编辑器（否则挂载后的空文本 Edit 会
+        // 把恢复的草稿覆盖掉——IDB E2E 判据 3 实录）。
+        #[cfg(target_arch = "wasm32")]
+        if taino_mode {
+            let draft_text = host.state().draft.snapshot.text.clone();
+            if !draft_text.is_empty() {
+                let schema = taino_editor_loop.peek().schema().clone();
+                let doc_slice = text_slice(&schema, &draft_text);
+                let size = doc_content_size(&taino_editor_loop);
+                let mut tx = taino_editor_loop.peek().tr();
+                tx.transform()
+                    .replace(0, size, doc_slice, &schema)
+                    .expect("restore replace");
+                let next = taino_editor_loop.peek().apply(tx);
+                taino_editor_loop.set(next);
+            }
+        }
         let mut session = composer_completion::CompletionSession::new();
         while let Some(ev) = rx.next().await {
             match ev {
@@ -702,6 +769,10 @@ fn app() -> Element {
                                     taino_editor_loop.set(next);
                                 }
                                 session.dismiss();
+                                sync_menu_view(&session, &mut menu_view_loop, &menu_open_loop);
+                            }
+                            MenuAction::Hover(index) => {
+                                session.set_highlight(index);
                                 sync_menu_view(&session, &mut menu_view_loop, &menu_open_loop);
                             }
                             MenuAction::Dismiss => {
@@ -946,6 +1017,10 @@ fn app() -> Element {
                                 "aria-selected": "{index == view.highlight}",
                                 "data-index": "{index}",
                                 class: if index == view.highlight { "candidate highlighted" } else { "candidate" },
+                                onmouseenter: move |_| {
+                                    let tx = events.clone();
+                                    tx.send(AppEvent::Menu(MenuAction::Hover(index)));
+                                },
                                 "{label}"
                             }
                         }
