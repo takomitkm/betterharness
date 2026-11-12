@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+body { font: 16px/1.6 system-ui, sans-serif; margin: 24px; }
+.panel { max-width: 720px; margin: 0 auto; }
+[contenteditable="true"] { min-height: 100px; border: 1px solid #999; border-radius: 8px; padding: 8px; white-space: pre-wrap; }
+.record { border-top: 1px dashed #bbb; padding: 6px 0; }
+</style></head><body>
+<div id="main"></div>
+<script type="module">
+import init, { spike_state } from './vendor/spike.js';
+init().then(() => { window.spike_state = spike_state; window.__booted = true; }).catch((e) => { document.body.prepend('WASM init failed: ' + e); });
+</script>
+</body></html>

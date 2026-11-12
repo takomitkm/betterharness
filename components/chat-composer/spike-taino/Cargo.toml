@@ -1,0 +1,23 @@
+[package]
+name = "spike-taino-composer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "E0 spike: taino-edit as the composer's Pure Rust Editor (Enter arbitration + IME discipline + FM01)"
+
+[workspace]
+
+[dependencies]
+dioxus = { version = "0.7", features = ["web"] }
+taino-edit-core = "0.7"
+taino-edit-dioxus = "0.7"
+taino-edit-extensions = "0.7"
+composer-keynav = { path = "../composer-rust-3/crates/composer-keynav" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+console_error_panic_hook = "0.1"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlElement", "EventTarget"] }
+
+[profile.release]
+opt-level = "s"
