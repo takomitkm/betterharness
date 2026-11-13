@@ -31,7 +31,9 @@ const composerView = () => page.evaluate(() => window.__composerView());
 const cardIds = () => page.evaluate(() =>
   Array.from(document.querySelectorAll('[data-testid="attachment-card"]')).map((el) => el.getAttribute("data-asset-id")));
 const freshPage = async () => {
-  await page.goto(`${server.url}?editor=taino`);
+  // 唯一 scope（E3c IDB 持久化后跨段隔离）+ rail 渲染等待。
+  const scope = `attach-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  await page.goto(`${server.url}?editor=taino&scope=${scope}`);
   await page.waitForFunction(() => window.__composerView !== undefined, { timeout: 30000 });
   await page.waitForSelector('[data-testid="attachment-input"]', { timeout: 15000 });
 };
@@ -86,10 +88,23 @@ check("4b outbox 快照带 attachment_ids", view.state.submissions[0]?.snapshot?
 // 5. 附件-only（无文本）可提交（has_content 附件面）
 await freshPage();
 await upload([{ name: "only.bin", mimeType: "application/octet-stream", buffer: Buffer.from([1, 2, 3, 4]) }]);
+await page.waitForSelector('[data-testid="attachment-card"]', { timeout: 10000 });
 await page.evaluate(() => document.querySelector('[contenteditable="true"]').focus());
 await page.keyboard.press("Enter");
-await page.waitForFunction(() => window.__composerView()?.state?.submissions?.length === 1, undefined, { timeout: 15000 });
+let diag5 = null;
+try {
+  await page.waitForFunction(() => window.__composerView()?.state?.submissions?.length === 1, undefined, { timeout: 15000 });
+} catch {
+  diag5 = await page.evaluate(() => ({
+    subs: window.__composerView()?.state?.submissions?.length,
+    draft: window.__composerView()?.state?.draft?.snapshot?.text,
+    ids: window.__composerView()?.state?.draft?.snapshot?.attachment_ids,
+    railCards: document.querySelectorAll('[data-testid="attachment-card"]').length,
+    focused: document.activeElement?.tagName,
+  }));
+}
 view = await composerView();
+if (diag5) console.log("5 diag:", JSON.stringify(diag5));
 check("5 附件-only 可提交", view.state.submissions[0]?.status === "accepted"
   && view.state.submissions[0]?.snapshot?.attachment_ids?.length === 1, JSON.stringify(view.state.submissions[0]?.snapshot));
 

@@ -219,6 +219,23 @@ fn mime_from_ext(name: &str) -> String {
     .into()
 }
 
+/// JS 定时器 sleep（wasm 无 std::time 睡眠；E3d 超时触发用）。
+#[cfg(target_arch = "wasm32")]
+async fn js_sleep(ms: u64) {
+    wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |resolve, _reject| {
+        window_set_timeout(resolve, ms as i32);
+    }))
+    .await
+    .ok();
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_name = setTimeout)]
+    fn window_set_timeout(handler: js_sys::Function, ms: i32);
+}
+
 /// 当前文档内容尺寸（事务替换的 to 端点）。
 #[cfg(target_arch = "wasm32")]
 fn doc_content_size(editor: &Signal<EditorState>) -> usize {
@@ -230,8 +247,13 @@ fn doc_content_size(editor: &Signal<EditorState>) -> usize {
 /// 纪律正确兜底转 uncertain，D004 实录）。persist 为内存面：演示台账存活于
 /// 镜像 signal；真持久化见 Phase 5 的 React WASM 线（IDB + BM07 CAS）。
 /// E3c：回环执行器 + IDB 持久化镜像（fire-and-forget；scope 键、整本 state JSON）。
+/// E3d：场景化交付（URL ?scenario=）——accept（默认）/reject/uncertain（丢 ack），
+/// 超时真触发（ScheduleTimeout 到点回 AttemptTimeout）。
 struct LoopbackExecutor {
     scope: String,
+    scenario: String,
+    /// 协程句柄槽：use_coroutine 返回后回填（鸡生蛋——executor 在协程内构造）。
+    events_slot: Rc<std::cell::RefCell<Option<Coroutine<AppEvent>>>>,
 }
 
 impl EffectExecutor for LoopbackExecutor {
@@ -254,6 +276,19 @@ impl EffectExecutor for LoopbackExecutor {
     ) -> DeliveryResult {
         // 回执 scope 必须与 RuntimeConfig.scope 一致（FM15）：写死 demo/main 会在
         // URL scope 隔离（E3c）下配错身份 → 全部转 uncertain。
+        match self.scenario.as_str() {
+            "reject" => {
+                return DeliveryResult::Rejected {
+                    reason: "回环拒绝（场景注入）".into(),
+                };
+            }
+            "uncertain" => {
+                return DeliveryResult::Uncertain {
+                    reason: "回环丢 ack（场景注入）".into(),
+                };
+            }
+            _ => {}
+        }
         DeliveryResult::Accepted {
             receipt: Receipt {
                 id: id.clone(),
@@ -263,7 +298,20 @@ impl EffectExecutor for LoopbackExecutor {
         }
     }
 
-    fn schedule_timeout(&mut self, _id: &MessageId, _attempt: &AttemptId, _deadline_ms: u64) {}
+    fn schedule_timeout(&mut self, id: &MessageId, attempt: &AttemptId, deadline_ms: u64) {
+        // 超时真触发：到点（或立即，若已过期）回 AttemptTimeout——FM04 链的 E2E 面。
+        let Some(events) = self.events_slot.borrow().clone() else {
+            return;
+        };
+        let id = id.clone();
+        let attempt = attempt.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let now = PlatformClock.now_ms();
+            let wait = deadline_ms.saturating_sub(now);
+            js_sleep(wait).await;
+            events.send(AppEvent::Runtime(Event::AttemptTimeout { id, attempt }));
+        });
+    }
 
     fn cancel_timeout(&mut self, _id: &MessageId, _attempt: &AttemptId) {}
 }
@@ -281,6 +329,8 @@ enum AppEvent {
     Detach(String),
     /// E3b：附件重排（composer-reorder 语义：asset 移动到目标下标）。
     MoveAsset { asset_id: String, target_index: f64 },
+    /// E3d：运行时切换交付场景（宿主可切传输行为；E2E retry 判据用）。
+    SetScenario(String),
 }
 
 /// 菜单开着时的键动作（KD has_menu 契约的 E2E 面）。
@@ -289,6 +339,8 @@ enum MenuAction {
     Up,
     Down,
     Accept,
+    /// 鼠标点击某项 = 定位该项并接受（TS CandidateMenu onPick 契约）。
+    Pick(usize),
     Dismiss,
     /// E3b+：鼠标悬停定位高亮（TS CandidateMenu onHighlight 同款）。
     Hover(usize),
@@ -458,6 +510,19 @@ fn app() -> Element {
     #[cfg(not(target_arch = "wasm32"))]
     let session_scope: String = "demo/main".into();
 
+    // E3d：交付场景（?scenario=reject/uncertain；缺省 accept）。
+    #[cfg(target_arch = "wasm32")]
+    let delivery_scenario: String = web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .and_then(|search| {
+            url::form_urlencoded::parse(search.trim_start_matches('?').as_bytes())
+                .find(|(k, _)| k == "scenario")
+                .map(|(_, v)| v.into_owned())
+        })
+        .unwrap_or_else(|| "accept".into());
+    #[cfg(not(target_arch = "wasm32"))]
+    let delivery_scenario: String = "accept".into();
+
     // 编辑器模式：?editor=taino 走 Pure Rust Editor（E1，D014）。
     #[cfg(target_arch = "wasm32")]
     let editor_mode_taino = web_sys::window()
@@ -518,11 +583,16 @@ fn app() -> Element {
     let menu_view_loop = menu_view.clone();
     let mut assets_loop = assets.clone();
     let mut rejections_loop = intake_rejections.clone();
+    let events_slot: Rc<std::cell::RefCell<Option<Coroutine<AppEvent>>>> = Rc::new(std::cell::RefCell::new(None));
+    let scope_for_hook = session_scope.clone();
     let events = use_coroutine(move |mut rx: UnboundedReceiver<AppEvent>| {
         // use_coroutine 的闭包是 FnMut：非 Copy 捕获在体内 clone，再进 async move。
         let menu_open_loop = menu_open_loop.clone();
         let mut menu_view_loop = menu_view_loop.clone();
         let session_scope = session_scope.clone();
+        let delivery_scenario = delivery_scenario.clone();
+        let events_slot_for_exec = events_slot.clone();
+        let events_slot_hook = events_slot.clone();
         async move {
         // E3c FM09：先读 IDB——有持久化记录则恢复（sending→uncertain 等 Runtime 语义），
         // 无则全新台账。
@@ -548,6 +618,8 @@ fn app() -> Element {
             scope_state,
             LoopbackExecutor {
                 scope: session_scope.clone(),
+                scenario: delivery_scenario.clone(),
+                events_slot: events_slot_for_exec,
             },
             PlatformClock,
             PlatformIds(0),
@@ -589,6 +661,13 @@ fn app() -> Element {
                     host.dispatch(event);
                     ledger.set(host.state().clone());
                     admitting.set(host.is_admitting());
+                    #[cfg(target_arch = "wasm32")]
+                    web_sys::console::log_1(&format!(
+                        "e3d: after subs={:?} admitting={} paused={}",
+                        host.state().submissions.iter().map(|x| x.status).collect::<Vec<_>>(),
+                        host.is_admitting(),
+                        host.is_paused(),
+                    ).into());
                     #[cfg(feature = "desktop")]
                     trace_state(host.state());
                     if was_submit && host.last_dispatch_handed_off() {
@@ -732,6 +811,11 @@ fn app() -> Element {
                         ledger.set(host.state().clone());
                     }
                 }
+                AppEvent::SetScenario(value) => {
+                    #[cfg(target_arch = "wasm32")]
+                    web_sys::console::log_1(&format!("e3d: scenario -> {value}").into());
+                    host.executor_mut().scenario = value;
+                }
                 AppEvent::Menu(action) => {
                     #[cfg(target_arch = "wasm32")]
                     if taino_mode {
@@ -744,7 +828,10 @@ fn app() -> Element {
                                 session.move_highlight(1);
                                 sync_menu_view(&session, &mut menu_view_loop, &menu_open_loop);
                             }
-                            MenuAction::Accept => {
+                            MenuAction::Accept | MenuAction::Pick(_) => {
+                                if let MenuAction::Pick(index) = action {
+                                    session.set_highlight(index);
+                                }
                                 if let Some(pick) = session.accept() {
                                     // pick：全文按 [start,end) 替换 → 事务重建内容
                                     let text = host.state().draft.snapshot.text.clone();
@@ -788,6 +875,58 @@ fn app() -> Element {
         }
         }
     });
+
+    // E3d 测试钩子：E2E 注入回执/超时（不可靠网络判据的驱动面）。
+    // 注册在 use_coroutine 之后——events 句柄此处已可用（协程内注册曾因槽位时序失效）。
+    #[cfg(target_arch = "wasm32")]
+    {
+        let tx_test = events.clone();
+        let scope_test = scope_for_hook.clone();
+        let hook = Closure::<dyn FnMut(js_sys::Object)>::new(move |cmd: js_sys::Object| {
+            let get = |key: &str| {
+                js_sys::Reflect::get(&cmd, &JsValue::from_str(key))
+                    .ok()
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_default()
+            };
+            match get("kind").as_str() {
+                "lookup" => {
+                    let mid = MessageId::new(&get("id"));
+                    let result = if get("status") == "rejected" {
+                        DeliveryResult::Rejected {
+                            reason: "查询回执：宿主明确拒绝".into(),
+                        }
+                    } else {
+                        DeliveryResult::Accepted {
+                            receipt: Receipt {
+                                id: mid.clone(),
+                                scope: ScopeId::new(scope_test.clone()),
+                                turn: TurnId::new(format!("turn-{}", get("id"))),
+                            },
+                        }
+                    };
+                    tx_test.send(AppEvent::Runtime(Event::LookupResult { id: mid, result }));
+                }
+                "timeout" => {
+                    tx_test.send(AppEvent::Runtime(Event::AttemptTimeout {
+                        id: MessageId::new(&get("id")),
+                        attempt: AttemptId::new(&get("attempt")),
+                    }));
+                }
+                "scenario" => {
+                    tx_test.send(AppEvent::SetScenario(get("value")));
+                }
+                _ => {}
+            }
+        });
+        let window = web_sys::window().expect("no window");
+        let _ = js_sys::Reflect::set(
+            window.as_ref(),
+            &JsValue::from_str("__composerTest"),
+            &hook.as_ref().unchecked_ref(),
+        );
+        hook.forget();
+    }
 
     // island 事件桥（web 专有）：JS Island CustomEvent → 强类型 Event 进协程（Phase 4 直调面）。
     // JSON 形状沿用 D009：{type: "submit-request"} / {type: "document-changed", text}。
@@ -1021,6 +1160,10 @@ fn app() -> Element {
                                     let tx = events.clone();
                                     tx.send(AppEvent::Menu(MenuAction::Hover(index)));
                                 },
+                                onclick: move |_| {
+                                    let tx = events.clone();
+                                    tx.send(AppEvent::Menu(MenuAction::Pick(index)));
+                                },
                                 "{label}"
                             }
                         }
@@ -1206,7 +1349,7 @@ fn RecordRow(events: Coroutine<AppEvent>, id: String, status: Status, text: Stri
                 button { onclick: move |_| events.send(AppEvent::Runtime(Event::Restore { id: MessageId::new(&recall_id) })), "取回编辑" }
             }
             if matches!(status, Status::Rejected) {
-                button { onclick: move |_| events.send(AppEvent::Runtime(Event::Retry { id: MessageId::new(&retry_id) })), "原样重试" }
+                button { "data-testid": "retry", onclick: move |_| events.send(AppEvent::Runtime(Event::Retry { id: MessageId::new(&retry_id) })), "原样重试" }
             }
         }
     }
